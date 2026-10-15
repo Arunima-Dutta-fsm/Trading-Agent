@@ -36,6 +36,7 @@ os.environ.update({
     "AABA_DB_PATH": str(BASE / "data" / "aaba.db"),
     "AABA_MODEL_RUN_DIR": str(BASE / "model-run"),
     "AABA_LOG_DIR": str(BASE / "logs"),
+    "AABA_REPORT_DIR": str(BASE / "reports"),
     "CREWAI_TRACING_ENABLED": "false",
     "CREWAI_DISABLE_TELEMETRY": "true",
     "OTEL_SDK_DISABLED": "true",

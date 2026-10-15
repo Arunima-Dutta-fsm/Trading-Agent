@@ -116,28 +116,47 @@ def page_overview():
         st.info(f"A run is in progress: {holder.get('label')}")
 
     g = dd.group_summary()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Group starting capital", money(g["starting_capital"]))
+    st.subheader("Combined portfolio (sum of the three separate accounts)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Starting capital", money(g["starting_capital"]))
     cur = g["current_value"]
-    c2.metric("Group value now", money(cur),
-              delta=f"{(cur / g['starting_capital'] - 1) * 100:+.2f}%" if cur else None)
-    c3.metric("SELLs waiting for approval", g["pending_approvals"])
+    c2.metric("Value now", money(cur), delta=f"{(cur / g['starting_capital'] - 1) * 100:+.2f}%" if cur else None)
+    c3.metric("Total P&L", money(g["total_pnl"]))
+    c4.metric("Today's P&L", money(g["day_pnl"]))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cash", money(g["cash"]))
+    c2.metric("Unrealized P&L", money(g["unrealized_pnl"]))
+    c3.metric("Realized P&L", money(g["realized_pnl"]))
+    c4.metric("SELLs waiting for approval", g["pending_approvals"])
+    st.caption("Values come from the latest broker snapshot of each account (saved after every run and every "
+               "reconcile). A total shows '-' until all three accounts have a snapshot.")
 
     rows = []
     for r in g["students"]:
         rows.append({"Student": r["student"], "Account": r["account"] or "-", "Verified": r["account_ok"],
                      "Cash": r["cash"], "Invested": r["invested"], "Equity": r["equity"],
+                     "Today's P&L": r["day_pnl"], "Total P&L": r["total_pnl"],
                      "Unrealized P&L": r["unrealized_pnl"], "Realized P&L": r["realized_pnl"],
                      "Return %": r["return_pct"], "BUY": r["buy"], "SELL": r["sell"], "HOLD": r["hold"],
                      "Open orders": r["open_orders"], "Pending approvals": r["pending_approvals"],
-                     "Errors": r["errors"]})
+                     "Errors": r["errors"], "Snapshot": r["snapshot_at"]})
     st.subheader("Students")
-    money_cols = ["Cash", "Invested", "Equity", "Unrealized P&L", "Realized P&L"]
+    money_cols = ["Cash", "Invested", "Equity", "Today's P&L", "Total P&L", "Unrealized P&L", "Realized P&L"]
     st.dataframe(pd.DataFrame(rows), hide_index=True,
                  column_config={c: st.column_config.NumberColumn(c, format="$%.2f") for c in money_cols})
 
+    st.subheader("All holdings (each row belongs to one student's own account)")
+    gh = dd.group_holdings()
+    if gh.empty:
+        st.caption("No positions in any account.")
+    else:
+        st.dataframe(gh.round(2), hide_index=True)
+
     st.subheader("Return vs SPY")
     series = {}
+    gp = dd.group_performance()
+    if not gp.empty:
+        series["Combined"] = gp["return_pct"]
     for r in g["students"]:
         p = dd.performance(r["student_id"])
         if not p.empty:
@@ -145,7 +164,9 @@ def page_overview():
             if "spy_return_pct" in p and "SPY" not in series:
                 series["SPY"] = p["spy_return_pct"]
     if series:
-        st.line_chart(pd.DataFrame(series).ffill(), y_label="% since tracking began")
+        st.line_chart(pd.DataFrame(series).sort_index().ffill(), y_label="% since tracking began")
+        st.caption("Each line starts at its own first snapshot. SPY is price return only (no dividends); the "
+                   "portfolios include their uninvested cash.")
     else:
         st.caption("No portfolio snapshots yet. They are saved after each run.")
 
@@ -173,9 +194,13 @@ def make_student_page(student_id: str):
                    f"{'enabled' if stc.enabled else 'DISABLED'}")
         sim_banner()
         r = dd.student_summary(student_id)
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Equity", money(r["equity"]), delta=f"{r['return_pct']:+.2f}%" if r["return_pct"] is not None else None)
         c2.metric("Cash", money(r["cash"]))
+        c3.metric("Invested", money(r["invested"]))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Today's P&L", money(r["day_pnl"]))
+        c2.metric("Total P&L", money(r["total_pnl"]))
         c3.metric("Unrealized P&L", money(r["unrealized_pnl"]))
         c4.metric("Realized P&L", money(r["realized_pnl"]))
         st.caption(f"Paper account {r['account'] or '-'} ({'verified' if r['account_ok'] else 'not verified'}); "
@@ -199,20 +224,28 @@ def make_student_page(student_id: str):
         else:
             st.dataframe(s, hide_index=True)
         st.subheader("SELL approvals")
-        ap = pd.DataFrame(db.student_approvals(student_id))
+        ap = dd.approvals_view(student_id)
         if ap.empty:
             st.caption("None.")
         else:
-            st.dataframe(ap[["approval_id", "symbol", "qty", "status", "created_at", "expires_at", "decided_by",
-                             "execution_detail"]], hide_index=True)
-            st.caption("Approve or reject in the Approval Centre (needs your PIN).")
+            st.dataframe(ap, hide_index=True)
+            st.caption("proposed_price is the signal's close, not a fill. fill_qty / fill_price / realized_pnl "
+                       "appear only after the broker reports the SELL as filled. Approve or reject in the "
+                       "Approval Centre (needs your own PIN).")
         st.subheader("Orders")
-        o = pd.DataFrame(db.student_orders(student_id))
+        o = dd.orders_view(student_id)
         if o.empty:
             st.caption("No orders.")
         else:
-            st.dataframe(o[["submitted_at", "side", "symbol", "qty", "status", "filled_qty", "filled_avg_price",
-                            "realized_pnl", "mode", "client_order_id", "error"]], hide_index=True)
+            st.dataframe(o, hide_index=True)
+            st.caption("proposed_price is the price used to size the order; fill_price is the broker-confirmed "
+                       "average fill and stays empty until shares are filled (refreshed by every reconcile).")
+        st.subheader("Blocked, failed, rejected or cancelled")
+        pr = dd.problems_view(student_id)
+        if pr.empty:
+            st.caption("None.")
+        else:
+            st.dataframe(pr, hide_index=True)
         st.subheader("Performance")
         p = dd.performance(student_id)
         if p.empty:

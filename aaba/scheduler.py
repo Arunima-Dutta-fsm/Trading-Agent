@@ -59,14 +59,19 @@ def approved_sell_job():
             return
     except Exception:  # noqa: BLE001
         return
-    for st in load_students().enabled:
-        try:
-            if db.student_approvals(st.student_id, ("APPROVED",)):
-                controller.process_approved_sells(st.student_id)
-            controller.reconcile_student(st.student_id)
-        except Exception as e:  # noqa: BLE001
-            db.log_event("ERROR", "scheduler", f"approved-sell check failed: {type(e).__name__}: {e}",
-                         student_id=st.student_id)
+    from .runlock import run_lock
+    try:
+        with run_lock("approved-sell check"):      # never alongside a workflow run; try again next cycle
+            for st in load_students().enabled:
+                try:
+                    if db.student_approvals(st.student_id, ("APPROVED",)):
+                        controller.process_approved_sells(st.student_id)
+                    controller.reconcile_student(st.student_id)
+                except Exception as e:  # noqa: BLE001
+                    db.log_event("ERROR", "scheduler", f"approved-sell check failed: {type(e).__name__}: {e}",
+                                 student_id=st.student_id)
+    except RunLocked:
+        db.log_event("INFO", "scheduler", "approved-sell check skipped: a workflow run is in progress")
 
 
 def start():

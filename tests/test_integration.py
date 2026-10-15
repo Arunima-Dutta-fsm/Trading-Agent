@@ -266,6 +266,34 @@ def test_dashboard_renders_without_errors(monkeypatch):
     assert "AABA" in text
 
 
+def test_approved_sell_job_never_overlaps_a_workflow_run(monkeypatch):
+    from conftest import add_signal, make_run
+    from aaba import approvals, controller, scheduler
+    run = make_run("paper", prices={"AMD": 150.0})
+    give_position("S2", "AMD", 20, 140.0, 150.0)
+    aid = controller.create_sell_approval(add_signal(run, "S2", "AMD", "SELL", 150.0)["signal_id"])["approval_id"]
+    approvals.decide(aid, "S2", "234223", "approve")
+    with run_lock("workflow"):
+        scheduler.approved_sell_job()                     # a run holds the lock: nothing happens
+    assert db.q1("SELECT status FROM approvals WHERE approval_id=?", (aid,))["status"] == "APPROVED"
+    assert "skipped" in db.q1("SELECT message FROM events WHERE kind='scheduler' ORDER BY id DESC")["message"]
+    scheduler.approved_sell_job()                         # lock free: the approved SELL is executed once
+    assert db.q1("SELECT status FROM approvals WHERE approval_id=?", (aid,))["status"] == "EXECUTED"
+    assert len(db.q("SELECT * FROM orders WHERE side='sell'")) == 1
+
+
+def test_scheduler_jobs_are_single_instance_at_new_york_times(monkeypatch):
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from aaba import scheduler
+    captured = {}
+    monkeypatch.setattr(BlockingScheduler, "start", lambda self: captured.update(
+        {j.id: (j.max_instances, str(j.trigger)) for j in self.get_jobs()}))
+    scheduler.start()
+    assert captured["daily-09:45"][0] == 1 and "hour='9', minute='45'" in captured["daily-09:45"][1]
+    assert "day_of_week='mon-fri'" in captured["daily-09:45"][1]
+    assert captured["approved-sells"][0] == 1
+
+
 def test_scheduler_skips_non_trading_days(monkeypatch):
     from aaba import scheduler
     from aaba.clock import parse_iso
