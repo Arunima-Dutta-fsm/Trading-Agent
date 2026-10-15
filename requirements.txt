@@ -1,0 +1,15 @@
+# Python 3.11 (recommended) or 3.12. Exact versions that were installed and tested together
+# on 13 Oct 2026. Install with:  pip install -r requirements.txt
+crewai==1.15.27
+crewai-tools[mcp]==1.15.27
+mcp==1.28.1
+google-genai==2.31.0    # needed by CrewAI's native Gemini provider (the fallback chain); not installed by crewai itself
+alpaca-py==0.44.0
+pandas==3.0.6
+numpy==2.4.6
+pydantic==2.12.5
+streamlit==1.65.0
+APScheduler==3.11.3
+python-dotenv==1.2.4
+tzdata==2026.5          # time zone data; Windows has none built in
+pytest==9.1.1

@@ -1,0 +1,10 @@
+# Packages for the READ-ONLY DEMO only (Streamlit Community Cloud, main file app/demo_app.py).
+# Streamlit Cloud uses this file because it sits next to the entry point. It deliberately leaves
+# out crewai, mcp and alpaca-py, so the hosted demo cannot reach a broker or an LLM at all.
+# The full trading system uses the requirements.txt in the project root.
+streamlit==1.65.0
+pandas==3.0.6
+numpy==2.4.6
+pydantic==2.12.5
+python-dotenv==1.2.4
+tzdata==2026.5

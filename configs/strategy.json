@@ -1,0 +1,90 @@
+{
+  "signal_mode": "rules",
+  "indicators": {
+    "ema_fast": 20,
+    "ema_mid": 50,
+    "ema_slow": 200,
+    "rsi_length": 14,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "atr_length": 14,
+    "bb_length": 20,
+    "bb_std": 2.0,
+    "obv_avg_length": 20
+  },
+  "satellite": {
+    "rsi_min": 50,
+    "rsi_max": 70,
+    "macd_cross_lookback": 3,
+    "require_obv_confirm": true,
+    "exit_below_ema_fast": true,
+    "trail_atr_mult": 3.0
+  },
+  "core": {
+    "rsi_oversold": 35,
+    "oversold_lookback": 3,
+    "rsi_exit": 65,
+    "exit_at_upper_band": true
+  },
+  "composite": {
+    "weight_trend": 0.3,
+    "weight_momentum": 0.3,
+    "weight_volume": 0.2,
+    "weight_news": 0.2,
+    "buy_above": 0.65,
+    "sell_below": 0.4
+  },
+  "risk": {
+    "stop_atr_mult": 2.0,
+    "risk_per_trade_pct": 1.0,
+    "max_position_pct": 15.0,
+    "satellite_allocation": 10000,
+    "core_allocation": 7500,
+    "min_order_value": 200,
+    "max_new_buys_per_run": 6,
+    "daily_loss_halt_pct": 5.0,
+    "max_price_age_minutes": 15,
+    "require_market_open": true
+  },
+  "news": {
+    "enabled": true,
+    "lookback_hours": 48,
+    "veto_below": -0.4,
+    "min_articles": 1
+  },
+  "earnings": {
+    "enabled": true,
+    "blackout_days": 2,
+    "block_if_unknown": false
+  },
+  "data": {
+    "feed": "sip",
+    "history_days": 420,
+    "sip_delay_minutes": 16,
+    "max_bar_age_sessions": 0
+  },
+  "approvals": {
+    "expiry_hours": 24,
+    "max_price_move_pct": 5.0,
+    "lockout_attempts": 5,
+    "lockout_minutes": 15
+  },
+  "schedule": {
+    "timezone": "America/New_York",
+    "run_times": ["09:45"],
+    "mode": "analysis",
+    "approved_sell_check_minutes": 15
+  },
+  "agent": {
+    "use_llm": true,
+    "safety_net_executes_buys": false,
+    "allow_agent_veto": true,
+    "max_iterations": 15,
+    "max_rpm": 20,
+    "crew_time_budget_seconds": 900
+  },
+  "reports": {
+    "timezone": "Asia/Kolkata"
+  }
+}

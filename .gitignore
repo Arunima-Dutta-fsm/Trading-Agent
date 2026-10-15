@@ -1,0 +1,46 @@
+# secrets - never commit
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# virtual environments and caches
+.venv/
+venv/
+.venv-crewai/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# generated runtime data (database, indicator CSVs, fake broker, locks)
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.lock
+
+# generated reports: kept out by default because they include account numbers.
+# Remove these two lines if you want to commit your model-run reports for submission.
+model-run/*
+!model-run/.gitkeep
+reports/*
+!reports/.gitkeep
+configs/history/
+
+# kept on disk but not in the repository:
+# - aaba-trading-agent/ is an older copy of main.py/README/requirements (superseded by the root files)
+# - *.patch: aaba_runtime_fallback.patch was applied; aaba/llm_fallback.py is the current version
+aaba-trading-agent/
+*.patch
+
+# editors / OS (.history is the VS Code Local History extension; it can hold copies of .env)
+.history/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

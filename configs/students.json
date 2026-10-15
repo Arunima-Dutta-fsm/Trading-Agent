@@ -1,0 +1,50 @@
+{
+  "_comment": "Stock assignments copied exactly from the submitted portfolio proposal (11 Oct 2026). Do not edit symbols without adding a line to 'replacements' explaining why.",
+  "group_name": "AABA Group (Akshita, Arunima, Navya)",
+  "reserves": {
+    "satellite": ["MRVL", "LRCX", "ANET"],
+    "core": []
+  },
+  "students": [
+    {
+      "student_id": "S1",
+      "name": "Akshita Jain",
+      "roll_no": "065009",
+      "enabled": true,
+      "env_prefix": "STUDENT1",
+      "starting_capital": 100000,
+      "satellites": ["NVDA", "HOOD", "APP", "RCL"],
+      "core": ["MSFT", "LLY", "JPM", "PG", "MCD", "HON", "SLB", "PLD"],
+      "replacements": []
+    },
+    {
+      "student_id": "S2",
+      "name": "Arunima Dutta",
+      "roll_no": "065014",
+      "enabled": true,
+      "env_prefix": "STUDENT2",
+      "starting_capital": 100000,
+      "satellites": ["AMD", "SHOP", "NET", "TSLA"],
+      "core": ["GOOGL", "JNJ", "GS", "KO", "AMZN", "UNP", "NEM", "NEE"],
+      "replacements": []
+    },
+    {
+      "student_id": "S3",
+      "name": "Navya Gupta",
+      "roll_no": "065015",
+      "enabled": true,
+      "env_prefix": "STUDENT3",
+      "starting_capital": 100000,
+      "satellites": ["MU", "COIN", "PLTR", "MRVL"],
+      "core": ["AAPL", "UNH", "V", "WMT", "HD", "GE", "XOM", "LIN"],
+      "replacements": [
+          {
+          "old": "NFLX",
+          "new": "MRVL",
+          "date": "2026-10-13",
+          "reason": "NFLX beta was 0.31, below the proposal's 1.3 minimum for growth satellites. MRVL was selected from the validated reserve list with beta 3.07 and 289 historical bars."
+        }
+      ]
+    }
+  ]
+}
