@@ -2,6 +2,8 @@
 Description=AABA trading agent scheduler (09:45 New York workflow + 15-minute approved-SELL check)
 Wants=network-online.target
 After=network-online.target
+# never give up restarting (systemd's default would stop after 5 failures in 10 s)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -24,7 +26,6 @@ ExecStart=/opt/aaba/.venv/bin/python main.py scheduler
 # one instance only (systemd), restarted after a crash; a missed run is caught up on start
 Restart=always
 RestartSec=30
-StartLimitIntervalSec=0
 TimeoutStopSec=120
 NoNewPrivileges=yes
 PrivateTmp=yes
