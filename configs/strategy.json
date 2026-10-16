@@ -72,13 +72,15 @@
   },
   "schedule": {
     "timezone": "America/New_York",
-    "run_times": ["09:45"],
-    "mode": "analysis",
+    "run_times": [
+      "09:45"
+    ],
+    "mode": "paper",
     "approved_sell_check_minutes": 15
   },
   "agent": {
     "use_llm": true,
-    "safety_net_executes_buys": false,
+    "safety_net_executes_buys": true,
     "allow_agent_veto": true,
     "max_iterations": 15,
     "max_rpm": 20,
