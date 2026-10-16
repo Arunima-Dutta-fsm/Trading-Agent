@@ -15,6 +15,8 @@ ETC=/etc/aaba
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
+cd /tmp                       # commands run as the service users must not depend on the caller's folder
+export UV_NO_CONFIG=1         # uv ignores uv.toml / pyproject files in any parent folder
 
 echo "== packages"
 apt-get update -qq
