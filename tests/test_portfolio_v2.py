@@ -193,3 +193,14 @@ def test_news_phrases_and_recency():
     assert score_text("Company raises guidance, beats estimates") == 1.0
     assert score_text("Analyst cuts price target after the company lowers guidance") == -1.0
     assert recency_weight(0) == 1.0 and recency_weight(24) == 0.5 and recency_weight(48) == 0.25
+
+
+def test_deployed_config_runs_engine_v2_in_paper_mode():
+    """configs/strategy.json is what the server runs (owner decision: v2 live paper trading)."""
+    import json as _json
+
+    from conftest import ROOT
+    from aaba.settings import StrategyConfig
+    cfg = StrategyConfig(**_json.loads((ROOT / "configs" / "strategy.json").read_text(encoding="utf-8")))
+    assert cfg.intraday.enabled and cfg.intraday.engine == "v2" and cfg.schedule.mode == "paper"
+    assert cfg.risk.require_market_open and cfg.risk.max_position_pct <= 15

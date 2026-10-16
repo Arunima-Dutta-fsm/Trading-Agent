@@ -18,7 +18,21 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 _BASE = Path(tempfile.mkdtemp(prefix="aaba-tests-"))
+
+
+def _test_strategy_file() -> str:
+    """The tests run on a copy of configs/strategy.json with intraday decisions OFF (the daily
+    strategy), whatever the deployed config says; intraday tests switch it on explicitly."""
+    import json
+    raw = json.loads((ROOT / "configs" / "strategy.json").read_text(encoding="utf-8"))
+    raw["intraday"] = {**raw.get("intraday", {}), "enabled": False, "engine": "v1"}
+    f = _BASE / "strategy-test.json"
+    f.write_text(json.dumps(raw), encoding="utf-8")
+    return str(f)
+
+
 TEST_ENV = {
+    "AABA_STRATEGY_FILE": _test_strategy_file(),
     "AABA_SKIP_DOTENV": "1",
     "AABA_DATA_PROVIDER": "synthetic",
     "AABA_BROKER": "fake",

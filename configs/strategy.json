@@ -88,5 +88,9 @@
   },
   "reports": {
     "timezone": "Asia/Kolkata"
+  },
+  "intraday": {
+    "enabled": true,
+    "engine": "v2"
   }
 }
