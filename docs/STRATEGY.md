@@ -135,3 +135,40 @@ made for that stock.
 
 **LLM use.** In intraday cycles the agent is called only when a cycle has a BUY or SELL; quiet
 cycles cost no LLM calls and write no report files.
+
+## Engine v2: regime-scaled momentum portfolio (`intraday.engine: "v2"`)
+
+Code: `aaba/portfolio.py`; settings: the `portfolio` section of `configs/strategy.json`.
+
+1. **Market regime** (once per run, completed daily bars): bull = SPY above EMA50 and EMA200 and at
+   least 50% of our 36 stocks above their EMA50; bear = SPY below EMA200 and under 40% above EMA50;
+   otherwise neutral. Invested share of each student's capital: bull 95%, neutral 60%, bear 25%.
+2. **Targets per student**: eligible = uptrend (close > EMA50 and EMA200, EMA20 > EMA50) with positive
+   blended momentum (0.5 x 20-session + 0.3 x 60-session + 0.2 x 120-session return) and no strong
+   negative news. The best 9 by risk-adjusted momentum (momentum / ATR%) are held. The proposal's
+   40% satellites / 60% core split is kept; inside each, weights are inverse to volatility and tilted
+   by news (x (1 + 0.3 x sentiment)), each capped at 15%.
+3. **Every 10 minutes**: BUY toward the target when 25%+ below it (the whole gap at or below VWAP,
+   half above), unless the stock is falling hard intraday, the market is weak, or price is stretched
+   (> 0.5 x ATR above VWAP or intraday RSI >= 80).
+4. **Exits (SELL approval requests)**: daily close below the chandelier stop (highest close since
+   entry - 3 x ATR), below EMA50 - 0.5 x ATR, momentum turned negative or news veto, or the intraday
+   emergency stop (entry - 3.5 x ATR). A lower rank alone never sells.
+5. **Risk limits kept**: 15% per stock, no margin, minimum order, 5% daily loss halt, BUYs per run and
+   per day, position risk to its stop <= 2% of capital, SELLs only with the student's PIN.
+
+## News sources
+
+Alpaca news (Benzinga, real time, free with the paper keys) is read for all 36 stocks in ONE request
+(up to 500 articles, pages followed). Scoring: word list plus analyst/earnings phrases (x3), weighted by
+recency (half per day). Stocktwits' API answered 403 (partner access needed) and NewsAPI's free plan
+delays articles 24 hours and is for development only, so neither is used for live decisions.
+
+## Trading hours and Alpaca's extended-hours rules
+
+The agent trades the **regular session only** (09:30-16:00 ET, risk check "market open"). Alpaca also
+offers pre-market (04:00-09:30), after-hours (16:00-20:00) and overnight (20:00-04:00, Sun-Fri) trading,
+but there: only LIMIT orders with `extended_hours=true` and time-in-force `day`/`gtc` are accepted;
+market, stop, bracket orders are rejected and trailing stops do not trigger; overnight needs an
+`overnight_tradable` asset and a separate data feed and does not run before market holidays; liquidity
+is thin and spreads wide. The agent's orders are market orders, so it does not trade off-hours.

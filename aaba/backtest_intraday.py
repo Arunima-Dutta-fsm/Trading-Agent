@@ -86,15 +86,17 @@ def _bar_at_or_after(day_data, t_utc):
 
 
 def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: StrategyConfig, days: list,
-                      approval_delay_min: int = 30) -> dict:
-    ic, rk = cfg.intraday, cfg.risk
+                      approval_delay_min: int = 30, engine: str = "v1") -> dict:
+    from . import portfolio as pf
+    ic, rk, pc = cfg.intraday, cfg.risk, cfg.portfolio
+    universe = load_students().all_symbols
     cols = colnames(cfg.indicators)
     cost = ic.cost_bps / 10_000
     cap_val = student.starting_capital * rk.max_position_pct / 100
     cash = student.starting_capital
     pos: dict[str, dict] = {}
     pending_sell: dict[str, tuple] = {}        # sym -> (execute_at_utc, reason)
-    equity, closed, log = [], [], []
+    equity, closed, log, invested = [], [], [], []
     stats = {"buys": 0, "adds": 0, "sell_requests": 0, "sells": 0, "fees": 0.0}
     didx = {s: {ts.date() if hasattr(ts, "date") else ts: i for i, ts in
                 enumerate(f["timestamp"].dt.tz_convert("America/New_York"))} for s, f in daily.items()}
@@ -139,6 +141,14 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                                 highest_close_since_entry=p.get("hi") if p else None, room_value=min(alloc, cap_val) - mv)
             dsig[sym] = evaluate_symbol(hist, sym, student.category(sym), cfg, position)
             ctxs[sym] = daily_context(hist, cols)
+        targets = {}
+        if engine == "v2":
+            hist_all = {s: daily[s].iloc[:didx[s][d]] for s in set(universe) | {"SPY"}
+                        if s in daily and didx[s].get(d)}
+            regime = pf.market_regime(hist_all, universe, cols, cfg)
+            targets = pf.compute_targets(student, hist_all, {}, cols, cfg, regime)
+            stats.setdefault("regimes", {})
+            stats["regimes"][regime["label"]] = stats["regimes"].get(regime["label"], 0) + 1
         spy_prev = None
         if spy_daily is not None and didx["SPY"].get(d):
             spy_prev = float(spy_daily["close"].iloc[didx["SPY"][d] - 1])
@@ -170,16 +180,22 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                 bar = dd[1][k]
                 last_px[sym] = float(bar["close"])
                 p = pos.get(sym)
-                if p:
-                    p["hi"] = max(p.get("hi", 0), float(bar["close"]))
+                if p and engine == "v1":
+                    p["hi"] = max(p.get("hi", 0), float(bar["close"]))     # v2 trails DAILY closes (end of day)
                 plan = PositionPlan(qty=p["qty"] if p else 0, avg_cost=p["avg"] if p else None,
                                     anchor_stop=p["stop"] if p else None, entries=p["entries"] if p else 0,
                                     last_entry_price=p["last"] if p else None,
                                     minutes_since_last_entry=(tu - p["last_t"]).total_seconds() / 60 if p else None,
                                     buys_today_student=buys_today, sell_pending=sym in pending_sell)
                 sig = dsig.get(sym)
-                dec = decide(sym, student.category(sym), cfg, ctxs[sym], bar, sig.action if sig else "HOLD",
-                             list(sig.reasons) if sig else [], [], market, plan)
+                if engine == "v2":
+                    daily_close = float(daily[sym]["close"].iloc[didx[sym][d] - 1])
+                    hold = pf.Holding(value=(p["qty"] * float(bar["close"])) if p else 0.0,
+                                      highest_close=p.get("hi") if p else None)
+                    dec = pf.decide_v2(sym, cfg, targets.get(sym, {}), daily_close, bar, plan, hold, market)
+                else:
+                    dec = decide(sym, student.category(sym), cfg, ctxs[sym], bar, sig.action if sig else "HOLD",
+                                 list(sig.reasons) if sig else [], [], market, plan)
                 if dec.action == "SELL" and p and sym not in pending_sell:
                     pending_sell[sym] = (tu + timedelta(minutes=approval_delay_min), "; ".join(dec.reasons))
                     stats["sell_requests"] += 1
@@ -188,13 +204,18 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                     if row is None:
                         continue
                     px = float(row["open"]) * (1 + cost)
-                    alloc = allocation_for(student.category(sym), cfg)
                     held_val = p["qty"] * px if p else 0.0
-                    room = (alloc * ic.initial_entry_fraction if dec.kind == "initial" else alloc) - held_val
+                    if engine == "v2":
+                        tgt = targets.get(sym, {}).get("target_value", 0.0)
+                        room = min(tgt - held_val, dec.evidence.get("buy_value") or 0.0)
+                    else:
+                        alloc = allocation_for(student.category(sym), cfg)
+                        room = (alloc * ic.initial_entry_fraction if dec.kind == "initial" else alloc) - held_val
                     room = min(room, cap_val - held_val, cash)
                     q_room = int(room // px) if room > 0 else 0
                     q_risk = risk_qty(cfg, student.starting_capital, px, dec.stop, p["qty"] if p else 0,
-                                      p["avg"] if p else None, dec.kind)
+                                      p["avg"] if p else None, "add" if engine == "v2" else dec.kind,
+                                      budget_pct=pc.max_position_risk_pct if engine == "v2" else None)
                     qty = min(q_room, q_risk)
                     if qty < 1 or qty * px < rk.min_order_value or px <= dec.stop:
                         continue
@@ -214,17 +235,22 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                                 "qty": qty, "price": round(px, 2), "stop": round(dec.stop, 2),
                                 "rr": round(dec.reward_risk or 0, 2), "why": dec.reasons[0][:120]})
             t += timedelta(minutes=ic.cycle_minutes)
-        # end of day: mark at the last candle's close
+        # end of day: mark at the last candle's close (v2: the trailing high uses daily closes)
         for sym in list(pos):
             dd = intra.get(sym, {}).get(d)
             if dd:
                 last_px[sym] = float(dd[1][-1]["close"])
+                if engine == "v2":
+                    pos[sym]["hi"] = max(pos[sym].get("hi") or 0.0, last_px[sym])
         v = mark()
+        invested.append(1 - cash / v if v else 0.0)
         equity.append((pd.Timestamp(d), v))
     eq = pd.Series([v for _, v in equity], index=[d for d, _ in equity])
     m = daily_bt._metrics(eq, closed, stats["buys"] + stats["adds"])
     return {"metrics": m.as_dict(), "stats": {**stats, "fees": round(stats["fees"], 2),
-                                               "open_positions_at_end": len(pos)},
+                                               "open_positions_at_end": len(pos),
+                                               "avg_invested_pct": round(100 * sum(invested) / len(invested), 1)
+                                               if invested else 0.0},
             "equity": eq, "trades": log}
 
 
@@ -252,7 +278,21 @@ def run_comparison(windows: list[tuple] | None = None, approval_delay_min: int =
         windows = [("recent 6 months", a[0].date(), a[-1].date()), ("previous 6 months", b[0].date(), b[-1].date())]
     first = min(w[1] for w in windows)
     last = max(w[2] for w in windows)
-    daily, intra, meta = load_data(cfg, symbols, first, last, provider)
+    import os
+    import pickle
+    cache = os.getenv("AABA_BACKTEST_CACHE", "").strip()       # optional local file: skip the long download
+    key = (tuple(symbols), str(first), str(last), cfg.intraday.bar_minutes, bool(getattr(provider, "simulated", 0)))
+    loaded = None
+    if cache and os.path.exists(cache):
+        with open(cache, "rb") as fh:
+            c = pickle.load(fh)
+        loaded = c["data"] if c.get("key") == key else None
+    if loaded is None:
+        loaded = load_data(cfg, symbols, first, last, provider)
+        if cache:
+            with open(cache, "wb") as fh:
+                pickle.dump({"key": key, "data": loaded}, fh)
+    daily, intra, meta = loaded
     out = {"meta": meta | {"simulated": bool(getattr(provider, "simulated", False)),
                            "approval_delay_min": approval_delay_min, "cost_bps_each_way": cfg.intraday.cost_bps,
                            "settings": cfg.intraday.model_dump()}, "windows": {}}
@@ -261,8 +301,10 @@ def run_comparison(windows: list[tuple] | None = None, approval_delay_min: int =
                 if w0 <= d.date() <= w1 and all(d.date() in intra.get(s, {}) for s in ("SPY",))]
         res = {"period": [str(days[0].date()), str(days[-1].date())], "sessions": len(days), "students": {}}
         sums = {}
+        cfg_v2 = cfg.model_copy(update={"intraday": cfg.intraday.model_copy(update={"engine": "v2"})})
         for st in group.students:
-            r_i = simulate_intraday(daily, intra, st, cfg, days, approval_delay_min)
+            r_i = simulate_intraday(daily, intra, st, cfg, days, approval_delay_min, engine="v1")
+            r_2 = simulate_intraday(daily, intra, st, cfg_v2, days, approval_delay_min, engine="v2")
             day_ts = [daily["SPY"]["timestamp"].iloc[i] for i, d in enumerate(daily["SPY"]["timestamp"].dt.tz_convert(
                 "America/New_York").dt.normalize()) if d in days]
             frames = {s: daily[s] for s in st.symbols if s in daily}
@@ -271,11 +313,14 @@ def run_comparison(windows: list[tuple] | None = None, approval_delay_min: int =
             spy = daily["SPY"].set_index("timestamp").loc[day_ts, "close"]
             spy = spy / spy.iloc[0] * st.starting_capital
             res["students"][st.student_id] = {
+                "new_engine_v2": {**r_2["metrics"], **r_2["stats"]},
+                "v2_trades_sample": r_2["trades"][:25],
                 "intraday_strategy": {**r_i["metrics"], **r_i["stats"]},
                 "daily_strategy": daily_bt._metrics(eq_d, closed_d, buys_d).as_dict(),
                 "buy_and_hold": _series_metrics(bh), "spy": _series_metrics(spy),
                 "trades_sample": r_i["trades"][:25]}
-            for k, s in (("intraday_strategy", r_i["equity"].values), ("daily_strategy", eq_d.values),
+            for k, s in (("new_engine_v2", r_2["equity"].values), ("intraday_strategy", r_i["equity"].values),
+                         ("daily_strategy", eq_d.values),
                          ("buy_and_hold", bh.values), ("spy", spy.values)):
                 sums[k] = s if k not in sums else sums[k] + s
         idx = pd.Index(range(len(days)))

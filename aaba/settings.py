@@ -152,9 +152,36 @@ class AgentCfg(BaseModel):
     crew_time_budget_seconds: int = Field(900, ge=30, le=7200)  # whole agent phase; then the safety net takes over
 
 
+class PortfolioCfg(BaseModel):
+    """Engine v2 (aaba/portfolio.py): regime-scaled, momentum-ranked, volatility-weighted targets."""
+    gross_bull: float = Field(0.95, ge=0, le=1)          # share of capital invested in each regime
+    gross_neutral: float = Field(0.60, ge=0, le=1)
+    gross_bear: float = Field(0.25, ge=0, le=1)
+    breadth_bull: float = Field(0.50, ge=0, le=1)        # share of our stocks above their EMA50
+    breadth_bear: float = Field(0.40, ge=0, le=1)
+    satellite_share: float = Field(0.40, ge=0, le=1)     # proposal: 4 x $10k satellites / 8 x $7.5k core
+    max_positions: int = Field(9, ge=1, le=15)           # per student, best momentum first
+    momentum_weights: list[float] = [0.5, 0.3, 0.2]      # 20 / 60 / 120-session returns
+    chandelier_atr: float = Field(3.0, gt=0, le=10)      # trailing stop: highest close since entry - k x ATR
+    trend_exit_atr: float = Field(0.5, ge=0, le=5)       # exit when close < EMA50 - k x ATR
+    emergency_stop_atr: float = Field(3.5, gt=0, le=10)  # intraday: price < anchored entry stop
+    rebalance_band: float = Field(0.25, ge=0, le=1)      # buy only if below target by this share of the target
+    max_chase_atr: float = Field(0.5, ge=0, le=5)        # no BUY more than this x ATR above VWAP
+    news_tilt: float = Field(0.3, ge=0, le=1)            # weight x (1 + tilt x sentiment)
+    max_position_risk_pct: float = Field(2.0, gt=0, le=5)  # position risk to its stop, % of capital
+
+    @field_validator("momentum_weights")
+    @classmethod
+    def _three(cls, v):
+        if len(v) != 3 or any(x < 0 for x in v) or abs(sum(v) - 1) > 1e-6:
+            raise ValueError("momentum_weights: three non-negative weights adding up to 1")
+        return v
+
+
 class IntradayCfg(BaseModel):
     """Intraday decisions (aaba/intraday.py). Off by default: the daily strategy is unchanged."""
     enabled: bool = False
+    engine: Literal["v1", "v2"] = "v1"                   # v1: rules + dips; v2: portfolio targets (aaba/portfolio.py)
     cycle_minutes: int = Field(10, ge=5, le=60)          # re-evaluate every N minutes in the session
     bar_minutes: int = Field(5, ge=1, le=30)             # completed intraday candles of this length
     first_cycle: str = "09:50"                           # New York time
@@ -201,6 +228,7 @@ class StrategyConfig(BaseModel):
     schedule: ScheduleCfg = ScheduleCfg()
     agent: AgentCfg = AgentCfg()
     intraday: IntradayCfg = IntradayCfg()
+    portfolio: PortfolioCfg = PortfolioCfg()
     reports: ReportCfg = ReportCfg()
 
 

@@ -73,6 +73,10 @@ class BuyContext:
     minutes_since_last_entry: float | None = None
     buys_today_student: int = 0
     sell_pending: bool = False
+    # engine v2: the position's target value replaces the fixed allocation; buy_value is the
+    # amount the decision wants to spend this cycle (the whole gap, or half of it above VWAP)
+    target_value: float | None = None
+    buy_value: float | None = None
 
 
 def allocation_for(category: str, cfg: StrategyConfig) -> float:
@@ -114,7 +118,7 @@ def check_buy(c: BuyContext) -> RiskResult:
         gap = c.minutes_since_last_entry
         add("time since last entry", gap is None or gap >= ic.min_minutes_between_entries,
             "first entry" if gap is None else f"{gap:.0f} min (minimum {ic.min_minutes_between_entries})")
-        if c.entry_kind == "add":
+        if c.entry_kind == "add" and c.target_value is None:          # v1 adds only; v2 buys toward its target
             need = (c.last_entry_price or 0) - ic.min_add_drop_atr * (c.atr or 0)
             ok = bool(c.latest_price and c.last_entry_price and c.atr and c.latest_price <= need)
             add("add only below the last entry", ok,
@@ -145,7 +149,13 @@ def check_buy(c: BuyContext) -> RiskResult:
     allocation = allocation_for(c.category, c.cfg)
     cap = c.student.starting_capital * r.max_position_pct / 100
     room_alloc = allocation - cur_value
-    if c.intraday and c.entry_kind == "initial":
+    v2 = c.intraday and c.target_value is not None
+    if v2:
+        allocation = c.target_value                     # engine v2: momentum/volatility target
+        room_alloc = c.target_value - cur_value
+        if c.buy_value is not None:
+            room_alloc = min(room_alloc, c.buy_value)
+    elif c.intraday and c.entry_kind == "initial":
         # leave room to add on later, evidence-based dips (scaling in)
         room_alloc = allocation * c.cfg.intraday.initial_entry_fraction - cur_value
     room_cap = cap - cur_value
@@ -163,7 +173,8 @@ def check_buy(c: BuyContext) -> RiskResult:
             from .intraday import risk_qty
             pos = c.positions.get(c.symbol, {})
             qty_risk = risk_qty(c.cfg, c.student.starting_capital, price, c.stop, float(pos.get("qty") or 0),
-                                float(pos.get("avg_entry") or 0) or None, c.entry_kind)
+                                float(pos.get("avg_entry") or 0) or None, "add" if v2 else c.entry_kind,
+                                budget_pct=c.cfg.portfolio.max_position_risk_pct if v2 else None)
         elif c.atr and c.atr > 0:
             risk_dollars = c.student.starting_capital * r.risk_per_trade_pct / 100
             qty_risk = math.floor(risk_dollars / (r.stop_atr_mult * c.atr))

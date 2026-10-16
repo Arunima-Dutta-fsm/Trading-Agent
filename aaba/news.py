@@ -40,15 +40,29 @@ NEGATIVE = {
     "subpoena", "fined", "delay", "delays", "resigns", "dilution",
 }
 WORD = re.compile(r"[a-z]+")
+# analyst/earnings phrases carry more information than single words: each counts 3 times
+POS_PHRASES = ("raises guidance", "raised guidance", "boosts guidance", "beats estimates", "tops estimates",
+               "price target raised", "raises price target", "upgraded to buy", "upgrade to buy",
+               "upgraded to outperform", "record revenue", "record quarter", "strong demand", "share buyback")
+NEG_PHRASES = ("cuts guidance", "lowers guidance", "lowered guidance", "misses estimates", "price target cut",
+               "cuts price target", "lowers price target", "downgraded to sell", "downgraded to underperform",
+               "downgrade to sell", "sec investigation", "class action", "going concern", "profit warning")
+NEWS_PAGE_LIMIT = 500        # all symbols in ONE request; alpaca-py follows the page tokens up to this many
 
 
 def score_text(text: str) -> float:
-    words = WORD.findall((text or "").lower())
-    pos = sum(w in POSITIVE for w in words)
-    neg = sum(w in NEGATIVE for w in words)
+    t = (text or "").lower()
+    words = WORD.findall(t)
+    pos = sum(w in POSITIVE for w in words) + 3 * sum(t.count(p) for p in POS_PHRASES)
+    neg = sum(w in NEGATIVE for w in words) + 3 * sum(t.count(p) for p in NEG_PHRASES)
     if pos + neg == 0:
         return 0.0
     return round((pos - neg) / (pos + neg), 3)
+
+
+def recency_weight(age_hours: float) -> float:
+    """Half the weight for each day of age: today's headline counts most."""
+    return 0.5 ** (max(age_hours, 0.0) / 24)
 
 
 def news_sentiment(symbols: list[str], cfg: NewsCfg) -> dict[str, dict]:
@@ -71,24 +85,32 @@ def news_sentiment(symbols: list[str], cfg: NewsCfg) -> dict[str, dict]:
         from alpaca.data.historical.news import NewsClient
         from alpaca.data.requests import NewsRequest
         client = NewsClient(key, secret)
-        start = clock.now_utc() - timedelta(hours=cfg.lookback_hours)
-        req = NewsRequest(symbols=",".join(sorted(symbols)), start=start, limit=50, exclude_contentless=False)
+        now = clock.now_utc()
+        start = now - timedelta(hours=cfg.lookback_hours)
+        # one request for every symbol (the old limit of 50 articles in total left most stocks without news)
+        req = NewsRequest(symbols=",".join(sorted(symbols)), start=start, limit=NEWS_PAGE_LIMIT,
+                          exclude_contentless=False)
         res = _retry(lambda: client.get_news(req), "news request")
         items = res.data.get("news", []) if hasattr(res, "data") else []
-        per: dict[str, list[float]] = {s: [] for s in symbols}
+        per: dict[str, list[tuple[float, float]]] = {s: [] for s in symbols}
         for n in items:
             headline = getattr(n, "headline", "") or ""
             summary = getattr(n, "summary", "") or ""
             sc = score_text(f"{headline} {summary}")
+            created = getattr(n, "created_at", None)
+            age = (now - created).total_seconds() / 3600 if created else cfg.lookback_hours
             for sym in getattr(n, "symbols", []) or []:
                 if sym in per:
-                    per[sym].append(sc)
+                    per[sym].append((sc, recency_weight(age)))
                     if len(out[sym]["headlines"]) < 3:
                         out[sym]["headlines"].append(headline[:140])
-        for sym, scores in per.items():
-            out[sym]["articles"] = len(scores)
+        for sym, scored in per.items():
+            out[sym]["articles"] = len(scored)
             out[sym]["status"] = "ok"
-            out[sym]["score"] = round(sum(scores) / len(scores), 3) if scores else None
+            wsum = sum(w for _, w in scored)
+            out[sym]["score"] = round(sum(s * w for s, w in scored) / wsum, 3) if wsum > 0 else None
+        if len(items) >= NEWS_PAGE_LIMIT:
+            log.warning("news: %s articles returned (the limit); older items were not read", len(items))
     except Exception as e:
         log.warning("news unavailable: %s", type(e).__name__)
         for s in out.values():

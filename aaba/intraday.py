@@ -294,14 +294,15 @@ def decide(symbol: str, category: str, cfg: StrategyConfig, daily: dict | None, 
 
 
 def risk_qty(cfg: StrategyConfig, capital: float, price: float, stop: float, held_qty: float,
-             held_avg: float | None, kind: str) -> int:
+             held_avg: float | None, kind: str, budget_pct: float | None = None) -> int:
     """Shares allowed by the risk budget. Initial: risk_per_trade_pct of capital to the stop.
-    Add: total risk of the whole position to the anchored stop <= max_position_risk_pct."""
+    Add: total risk of the whole position to the anchored stop <= max_position_risk_pct
+    (or `budget_pct`, used by engine v2)."""
     per_share = price - stop
     if per_share <= 0:
         return 0
     if kind == "add":
-        budget = capital * cfg.intraday.max_position_risk_pct / 100
+        budget = capital * (budget_pct if budget_pct is not None else cfg.intraday.max_position_risk_pct) / 100
         held_risk = max(held_qty * ((held_avg or price) - stop), 0.0)
         return max(int((budget - held_risk) // per_share), 0)
     return max(int((capital * cfg.risk.risk_per_trade_pct / 100) // per_share), 0)
