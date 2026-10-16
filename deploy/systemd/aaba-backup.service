@@ -1,0 +1,9 @@
+[Unit]
+Description=AABA database backup (consistent SQLite copy, 14 days kept)
+
+[Service]
+Type=oneshot
+User=aaba
+Group=aabadata
+UMask=0007
+ExecStart=/bin/sh -c 'f=/var/lib/aaba/backups/aaba-$(date -u +%%Y%%m%%d).db; sqlite3 /var/lib/aaba/data/aaba.db ".backup $f" && sqlite3 "$f" "PRAGMA integrity_check;" | grep -qx ok && find /var/lib/aaba/backups -name "aaba-*.db" -mtime +14 -delete'

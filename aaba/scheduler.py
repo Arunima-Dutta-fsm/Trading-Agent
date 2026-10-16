@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 
-from . import controller, db, demo, paths
+from . import clock, controller, db, demo, monitoring, paths
 from .market_data import get_provider
 from .runlock import RunLocked
 from .settings import load_strategy, load_students
@@ -23,37 +23,102 @@ from .settings import load_strategy, load_students
 log = logging.getLogger("aaba.scheduler")
 
 
-def _is_trading_day() -> tuple[bool, str]:
+DAILY = "HEALTHCHECK_DAILY_URL"
+HEARTBEAT = "HEALTHCHECK_HEARTBEAT_URL"
+CATCH_UP_STOP_BEFORE_CLOSE_MIN = 30     # no catch-up run in the last 30 minutes of a session
+MAX_CATCH_UPS_PER_DAY = 2               # a crash loop cannot keep re-running the workflow
+
+
+def _today_session():
+    """(now in New York, today's session or None) from the market calendar (Alpaca in real use)."""
     p = get_provider()
-    c = p.market_clock()
-    today = c.timestamp.date()
+    now_ny = p.market_clock().timestamp
+    today = now_ny.date()
     sess = [s for s in p.sessions(today, today) if s.date == today]
-    return bool(sess), f"{today}: {'trading day' if sess else 'market holiday/weekend'}"
+    return now_ny, (sess[0] if sess else None)
 
 
-def daily_job():
+def _is_trading_day() -> tuple[bool, str]:
+    now_ny, sess = _today_session()
+    return bool(sess), f"{now_ny.date()}: {'trading day' if sess else 'market holiday/weekend'}"
+
+
+def daily_job(trigger: str = "scheduler"):
     demo.guard("starting scheduled runs")
     from agents.trading_crew import run_workflow
     cfg = load_strategy()
+    monitoring.ping(DAILY, "start")
     try:
         ok, why = _is_trading_day()
     except Exception as e:  # noqa: BLE001
         db.log_event("ERROR", "scheduler", f"calendar check failed: {type(e).__name__}: {e}")
+        monitoring.ping(DAILY, "fail", f"calendar check failed: {type(e).__name__}")
         return
     if not ok:
         db.log_event("INFO", "scheduler", f"skipped: {why}")
+        monitoring.ping(DAILY, "", f"skipped: {why}")          # a holiday is a normal, successful day
         return
     try:
-        res = run_workflow(cfg.schedule.mode, "scheduler")
+        res = run_workflow(cfg.schedule.mode, trigger)
         log.info("run %s finished: %s", res["run_id"], res["status"])
+        summary = f"{res['run_id']} {res['mode']} {res['status']} agent_error={res.get('agent_error')}"
+        monitoring.ping(DAILY, "" if res["status"] == "DONE" else "fail", summary)
     except RunLocked as e:
         db.log_event("WARNING", "scheduler", f"skipped: {e}")
+        monitoring.ping(DAILY, "fail", f"skipped, another run holds the lock: {e}")
     except Exception as e:  # noqa: BLE001
         db.log_event("ERROR", "scheduler", f"run failed: {type(e).__name__}: {e}")
+        monitoring.ping(DAILY, "fail", f"run failed: {type(e).__name__}")
+
+
+def catch_up_if_missed() -> str:
+    """After a restart: if today's scheduled run was missed (server down, crash), run it now,
+    but only on a trading day, after the scheduled time and well before today's close.
+    Returns what it decided (also logged)."""
+    demo.guard("starting scheduled runs")
+    from datetime import datetime, timedelta
+    cfg = load_strategy()
+    try:
+        now_ny, sess = _today_session()
+    except Exception as e:  # noqa: BLE001
+        return _log_catch_up(f"no catch-up: calendar check failed ({type(e).__name__})")
+    if not sess:
+        return _log_catch_up(f"no catch-up: {now_ny.date()} is not a trading day")
+    first = min(cfg.schedule.run_times)
+    due = datetime(now_ny.year, now_ny.month, now_ny.day, *map(int, first.split(":")), tzinfo=now_ny.tzinfo)
+    latest = sess.close - timedelta(minutes=CATCH_UP_STOP_BEFORE_CLOSE_MIN)
+    if now_ny < due:
+        return _log_catch_up(f"no catch-up: before the {first} run")
+    if now_ny > latest:
+        return _log_catch_up(f"no catch-up: too close to today's close ({sess.close:%H:%M} New York)")
+    from .runlock import run_lock
+    try:
+        with run_lock("catch-up check"):
+            for old in db.close_abandoned_runs():      # a run left RUNNING by the crash is not "done"
+                db.log_event("WARNING", "recovery", f"run {old} was left unfinished; marked ABANDONED", old)
+    except RunLocked:
+        return _log_catch_up("no catch-up: a run is in progress")
+    start = now_ny.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(clock.UTC)
+    today = db.q("SELECT trigger, status FROM runs WHERE started_at>=? AND mode=? AND trigger IN "
+                 "('scheduler','catch-up')", (clock.iso(start), cfg.schedule.mode))
+    if any(r["status"].startswith("DONE") or r["status"] == "RUNNING" for r in today):
+        return _log_catch_up("no catch-up: today's scheduled run already happened")
+    if sum(r["trigger"] == "catch-up" for r in today) >= MAX_CATCH_UPS_PER_DAY:
+        return _log_catch_up(f"no catch-up: already tried {MAX_CATCH_UPS_PER_DAY} times today")
+    _log_catch_up(f"catch-up: today's {first} run was missed; running now")
+    daily_job("catch-up")
+    return "ran"
+
+
+def _log_catch_up(msg: str) -> str:
+    db.log_event("WARNING" if msg.startswith("catch-up") else "INFO", "scheduler", msg)
+    log.info(msg)
+    return msg
 
 
 def approved_sell_job():
     demo.guard("scheduled SELL execution")
+    monitoring.ping(HEARTBEAT)          # the scheduler process is alive (every 15 min, day and night)
     try:
         if not get_provider().market_clock().is_open:
             return
@@ -93,6 +158,11 @@ def start():
                       id=f"daily-{t}", max_instances=1, coalesce=True, misfire_grace_time=900)
     sched.add_job(approved_sell_job, IntervalTrigger(minutes=cfg.schedule.approved_sell_check_minutes, timezone=tz),
                   id="approved-sells", max_instances=1, coalesce=True)
+    # after a restart, run today's workflow if it was missed (checked once, 30 s after start)
+    from apscheduler.triggers.date import DateTrigger
+    from datetime import datetime, timedelta
+    sched.add_job(catch_up_if_missed, DateTrigger(run_date=datetime.now(sched.timezone) + timedelta(seconds=30)),
+                  id="catch-up", max_instances=1)
     db.log_event("INFO", "scheduler", f"started: runs at {cfg.schedule.run_times} {tz}, mode={cfg.schedule.mode}")
     print(f"Scheduler started. Workflow at {', '.join(cfg.schedule.run_times)} ({tz}), Mon-Fri, "
           f"mode '{cfg.schedule.mode}'. Approved SELL check every {cfg.schedule.approved_sell_check_minutes} min. "

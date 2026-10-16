@@ -18,6 +18,37 @@ def last_run() -> dict | None:
     return db.q1("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1")
 
 
+STALE_SNAPSHOT_MINUTES = 45      # the scheduler reconciles every 15 min while the market is open
+RUN_EXPECTED_BY = (10, 30)       # New York time: the 09:45 run should have started by then
+
+
+def freshness(now=None) -> dict:
+    """How current the data is, plus warnings to show at the top of every page.
+    Weekday rules only: on a market holiday the 'no run today' warning says so."""
+    from datetime import time as dtime
+    now = now or clock.now_utc()
+    ny = clock.to_ny(now)
+    run = last_run()
+    snap = db.q1("SELECT MAX(at) AS at FROM snapshots")
+    snap_at = clock.parse_iso(snap["at"]) if snap and snap["at"] else None
+    age = round((now - snap_at).total_seconds() / 60) if snap_at else None
+    warnings = []
+    weekday = ny.weekday() < 5
+    today_start = clock.iso(ny.replace(hour=0, minute=0, second=0, microsecond=0))
+    ran_today = bool(db.q1("SELECT run_id FROM runs WHERE started_at>=? LIMIT 1", (today_start,)))
+    if weekday and ny.time() >= dtime(*RUN_EXPECTED_BY) and not ran_today:
+        warnings.append("No workflow run has started today (expected 09:45 New York). Check the scheduler, "
+                        "unless today is a US market holiday.")
+    if weekday and dtime(9, 45) <= ny.time() < dtime(16, 15) and (age is None or age > STALE_SNAPSHOT_MINUTES):
+        warnings.append(f"Portfolio data is stale: last broker snapshot "
+                        f"{'never' if age is None else f'{age} min ago'} (expected every 15 min while the market "
+                        f"is open).")
+    if run and run["status"] in ("FAILED", "ABANDONED"):
+        warnings.append(f"The last workflow run ended {run['status']}: {(run['error'] or '')[:200]}")
+    return {"now": now, "snapshot_at": snap_at, "snapshot_age_min": age, "last_run": run,
+            "ran_today": ran_today, "warnings": warnings}
+
+
 def last_snapshot_meta() -> dict | None:
     return db.q1("SELECT * FROM market_snapshots ORDER BY fetched_at DESC LIMIT 1")
 

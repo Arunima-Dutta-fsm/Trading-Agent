@@ -69,8 +69,8 @@ def create_request(run_id: str, signal: dict, student_id: str, account_number: s
 
 
 def expire_stale() -> int:
-    if demo.is_demo():
-        return 0            # the demo database is never changed after it is built
+    if demo.is_read_only():
+        return 0            # read-only processes never change the database
     n = db.ex("UPDATE approvals SET status='EXPIRED', decision_note='not decided before expiry' "
               "WHERE status='PENDING' AND expires_at < ?", (clock.iso(),))
     n += db.ex("UPDATE approvals SET status='EXPIRED', decision_note='approved but not executed before expiry' "
@@ -121,7 +121,7 @@ def verify_admin_pin(pin: str) -> bool:
     """DASHBOARD_ADMIN_PIN check for protected dashboard actions (never valid in demo mode)."""
     import os
     expected = os.getenv("DASHBOARD_ADMIN_PIN", "").strip()
-    if demo.is_demo() or pin_problem(expected) or not pin:
+    if demo.is_read_only() or pin_problem(expected) or not pin:
         return False
     return hmac.compare_digest(str(pin).strip().encode(), expected.encode())
 
@@ -136,8 +136,9 @@ def verify_pin(student_id: str, pin: str) -> bool:
 
 def decide(approval_id: str, claimed_student_id: str, pin: str, decision: str, note: str = "") -> dict:
     """decision: 'approve' or 'reject'. Raises ApprovalError with a plain reason on refusal."""
-    if demo.is_demo():
-        raise ApprovalError("read-only demo: SELL approvals are disabled")
+    if demo.is_read_only():
+        raise ApprovalError("read-only demo: SELL approvals are disabled" if demo.is_demo()
+                            else "read-only dashboard: SELL approvals are disabled here")
     decision = decision.lower().strip()
     if decision not in ("approve", "reject"):
         raise ApprovalError("decision must be approve or reject")

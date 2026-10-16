@@ -1,0 +1,36 @@
+[Unit]
+Description=AABA trading agent scheduler (09:45 New York workflow + 15-minute approved-SELL check)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=aaba
+Group=aaba
+SupplementaryGroups=aabadata
+UMask=0002
+WorkingDirectory=/opt/aaba
+Environment=AABA_ENV_FILE=/etc/aaba/engine.env
+Environment=AABA_DATA_DIR=/var/lib/aaba/data
+Environment=AABA_DB_PATH=/var/lib/aaba/data/aaba.db
+Environment=AABA_MODEL_RUN_DIR=/var/lib/aaba/model-run
+Environment=AABA_REPORT_DIR=/var/lib/aaba/reports
+Environment=AABA_LOG_DIR=/var/log/aaba
+Environment=PYTHONUNBUFFERED=1
+Environment=CREWAI_TRACING_ENABLED=false
+Environment=CREWAI_DISABLE_TELEMETRY=true
+Environment=OTEL_SDK_DISABLED=true
+ExecStart=/opt/aaba/.venv/bin/python main.py scheduler
+# one instance only (systemd), restarted after a crash; a missed run is caught up on start
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+TimeoutStopSec=120
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/aaba /var/log/aaba /opt/aaba/configs /home/aaba
+
+[Install]
+WantedBy=multi-user.target

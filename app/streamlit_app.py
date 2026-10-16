@@ -25,7 +25,7 @@ import streamlit as st  # noqa: E402
 
 from aaba import approvals, clock, controller, db, paths  # noqa: E402
 from aaba import broker as brokers  # noqa: E402
-from aaba.demo import guard, is_demo  # noqa: E402
+from aaba.demo import guard, is_demo, is_read_only  # noqa: E402
 from aaba.runlock import current_holder  # noqa: E402
 from aaba.settings import (StrategyConfig, is_simulated, load_strategy, load_students,  # noqa: E402
                            paper_orders_enabled, save_strategy, set_student_enabled)
@@ -35,7 +35,10 @@ st.set_page_config(page_title="AABA Trading Agent", page_icon="📈", layout="wi
 paths.ensure_dirs()
 db.init_db()
 DEMO = is_demo()     # read-only public demo: controls are hidden here AND refused server-side (aaba/demo.py)
-DEMO_NOTE = "Disabled in the read-only demo."
+READ_ONLY = is_read_only()   # demo OR the private live dashboard (AABA_READ_ONLY=1): no action controls
+DEMO_NOTE = "Disabled in the read-only demo." if DEMO else "Disabled on the read-only dashboard."
+# live dashboard: reload all data every N seconds (0 = off; the static demo never needs it)
+REFRESH_SECONDS = 0 if DEMO else int(os.getenv("AABA_DASHBOARD_REFRESH_SECONDS", "60" if READ_ONLY else "0") or 0)
 
 
 def money(x):
@@ -53,6 +56,23 @@ def sim_banner():
     elif is_simulated():
         st.warning("SIMULATED MODE: prices and/or broker are fake (AABA_DATA_PROVIDER / AABA_BROKER). "
                    "Nothing here is real market data or a real order.")
+    if not DEMO:
+        freshness_banner()
+
+
+def freshness_banner():
+    f = dd.freshness()
+    tz = load_strategy().reports.timezone
+    snap = (f"{clock.fmt_local(f['snapshot_at'], tz)} ({f['snapshot_age_min']} min ago)"
+            if f["snapshot_at"] else "none yet")
+    run = f["last_run"]
+    run_txt = (f"{run['mode']} run {run['status']} at {clock.fmt_local(clock.parse_iso(run['started_at']), tz)}"
+               if run else "none yet")
+    st.caption(f"Last broker data: {snap} · Last workflow run: {run_txt} · Page loaded "
+               f"{clock.fmt_local(f['now'], tz)}" + (f" · refreshes every {REFRESH_SECONDS} s" if REFRESH_SECONDS
+                                                       else "") + (" · READ-ONLY" if READ_ONLY else ""))
+    for w in f["warnings"]:
+        st.warning(w)
 
 
 def start_run(mode: str, no_llm: bool = False) -> str:
@@ -171,7 +191,7 @@ def page_overview():
         st.caption("No portfolio snapshots yet. They are saved after each run.")
 
     st.subheader("Run now")
-    if DEMO:
+    if READ_ONLY:
         st.caption(DEMO_NOTE)
     else:
         run_controls(holder)
@@ -255,7 +275,7 @@ def make_student_page(student_id: str):
             cols = ["return_pct"] + (["spy_return_pct"] if "spy_return_pct" in p else [])
             st.line_chart(p[cols], y_label="% return")
             st.line_chart(p[["drawdown_pct"]], y_label="drawdown %")
-        if not DEMO and st.button("Refresh from Alpaca", key=f"rec_{student_id}"):
+        if not READ_ONLY and st.button("Refresh from Alpaca", key=f"rec_{student_id}"):
             try:
                 st.write(controller.reconcile_student(student_id))
             except Exception as e:  # noqa: BLE001
@@ -286,8 +306,9 @@ def page_approvals():
             ev = json.loads(ap["evidence"] or "{}")
             with st.expander("Indicator evidence"):
                 st.json({k: v for k, v in ev.items() if k not in ("news",)})
-            if DEMO:
-                st.caption(f"Approve / reject: {DEMO_NOTE}")
+            if READ_ONLY:
+                st.caption(f"Approve / reject: {DEMO_NOTE}" + ("" if DEMO else
+                           " Approve with: sudo aaba approve <approval id> --student <S1/S2/S3> on the server."))
                 continue
             if ap["status"] == "APPROVED":
                 st.info(ap.get("execution_detail") or "Approved; will be sent after the re-check.")
@@ -324,7 +345,7 @@ def page_approvals():
 def page_config():
     st.title("Strategy and configuration")
     cfg = load_strategy()
-    if DEMO:
+    if READ_ONLY:
         sim_banner()
         st.caption(f"Settings shown read-only. Changing them: {DEMO_NOTE}")
         st.json(cfg.model_dump())
@@ -427,7 +448,7 @@ def page_history():
 def page_system():
     st.title("System checks")
     sim_banner()
-    if DEMO:
+    if READ_ONLY:
         st.caption(f"Account checks, MCP self-test, symbol validation and run logs: {DEMO_NOTE}")
         return
     st.write(f"Project folder: `{ROOT}`  \nDatabase: `{paths.db_path()}`")
@@ -465,4 +486,14 @@ pages = {
                         default=start == "history"),
                 st.Page(page_system, title="System", icon="🛠️", url_path="system", default=start == "system")],
 }
+if REFRESH_SECONDS:
+    @st.fragment(run_every=REFRESH_SECONDS)
+    def _auto_refresh():
+        # first call (inside a full page run) arms the timer; the timed call reruns the whole page
+        if st.session_state.get("_refresh_armed"):
+            st.session_state["_refresh_armed"] = False
+            st.rerun()
+        st.session_state["_refresh_armed"] = True
+
+    _auto_refresh()
 st.navigation(pages).run()

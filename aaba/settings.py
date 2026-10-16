@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from . import demo, paths
 
 if os.getenv("AABA_SKIP_DOTENV", "").lower() not in ("1", "true"):   # tests set this so a real .env is ignored
-    load_dotenv(paths.ROOT / ".env", override=False)
+    # on the server the secrets live outside the code folder (deploy/README: /etc/aaba/engine.env)
+    load_dotenv(os.getenv("AABA_ENV_FILE") or (paths.ROOT / ".env"), override=False)
 
 RunMode = Literal["analysis", "dry_run", "paper"]
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z.]{0,9}$")
@@ -226,7 +227,7 @@ class StudentConfig(BaseModel):
 
     # credentials are read from the environment on demand and never stored
     def alpaca_keys(self) -> tuple[str, str]:
-        if demo.is_demo():
+        if demo.is_read_only():
             return "", ""
         return (os.getenv(f"{self.env_prefix}_ALPACA_API_KEY", "").strip(),
                 os.getenv(f"{self.env_prefix}_ALPACA_SECRET_KEY", "").strip())
@@ -235,7 +236,7 @@ class StudentConfig(BaseModel):
         return os.getenv(f"{self.env_prefix}_ALPACA_ACCOUNT_NUMBER", "").strip()
 
     def approval_pin(self) -> str:
-        if demo.is_demo():
+        if demo.is_read_only():
             return ""
         return os.getenv(f"{self.env_prefix}_APPROVAL_PIN", "").strip()
 
@@ -358,6 +359,8 @@ def paper_orders_enabled() -> bool:
     fills simulated orders, on the fake broker)."""
     if demo.is_demo():
         return demo.seeding_active()
+    if demo.is_read_only():
+        return False
     return env_bool("ENABLE_PAPER_ORDERS", False)
 
 

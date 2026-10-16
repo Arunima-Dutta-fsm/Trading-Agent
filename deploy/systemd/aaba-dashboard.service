@@ -1,0 +1,25 @@
+[Unit]
+Description=AABA private live dashboard (read-only, localhost only; published on the tailnet by tailscale serve)
+After=network-online.target
+
+[Service]
+Type=simple
+User=aabaweb
+Group=aabadata
+UMask=0002
+WorkingDirectory=/opt/aaba
+EnvironmentFile=/etc/aaba/dashboard.env
+Environment=HOME=/var/lib/aaba/web
+Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+ExecStart=/opt/aaba/.venv/bin/python -m streamlit run app/streamlit_app.py \
+    --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/aaba /var/log/aaba
+
+[Install]
+WantedBy=multi-user.target

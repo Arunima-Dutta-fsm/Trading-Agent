@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Run any main.py command on the server as the trading service user, with the server settings.
+#   sudo aaba check | approvals | approve <id> --student S2 [--reject] | run --mode analysis | reconcile
+# Secrets are read from /etc/aaba/engine.env by the program itself (never printed).
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "use: sudo aaba $*"; exit 1; }
+cd /opt/aaba
+exec sudo -u aaba -- env \
+  AABA_ENV_FILE=/etc/aaba/engine.env \
+  AABA_DATA_DIR=/var/lib/aaba/data AABA_DB_PATH=/var/lib/aaba/data/aaba.db \
+  AABA_MODEL_RUN_DIR=/var/lib/aaba/model-run AABA_REPORT_DIR=/var/lib/aaba/reports AABA_LOG_DIR=/var/log/aaba \
+  CREWAI_TRACING_ENABLED=false CREWAI_DISABLE_TELEMETRY=true OTEL_SDK_DISABLED=true \
+  /opt/aaba/.venv/bin/python main.py "$@"
