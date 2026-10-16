@@ -178,10 +178,30 @@ class PortfolioCfg(BaseModel):
         return v
 
 
+class AdaptiveCfg(BaseModel):
+    """Engine v3 (aaba/adaptive.py): stock-specific profiles, confirmed exits, deliberate holding.
+    The tunable values below were chosen on the TUNING window only (see configs/v3_frozen.json)."""
+    gross_bull: float = Field(0.98, ge=0, le=1)
+    gross_neutral: float = Field(0.80, ge=0, le=1)
+    gross_bear: float = Field(0.40, ge=0, le=1)
+    profile_days: int = Field(250, ge=120, le=750)        # trailing sessions used for each stock's profile
+    pullback_quantile: float = Field(0.90, gt=0.5, lt=1)  # "normal" pullback depth from the 20-day high, ATR units
+    stop_scale: float = Field(1.0, gt=0, le=3)            # stock-specific trailing stop = scale x normal pullback
+    stop_min_atr: float = Field(3.0, gt=0, le=10)
+    stop_max_atr: float = Field(7.0, gt=0, le=15)
+    confirm_days: int = Field(2, ge=1, le=10)             # consecutive closes beyond the stop needed to exit
+    loss_cap_atr: float = Field(5.0, gt=0, le=20)         # hard cap: close below entry - k x ATR always exits
+    cooldown_days: int = Field(5, ge=0, le=30)            # no re-entry after an exit, unless a new 20-day high
+    er_trend: float = Field(0.30, ge=0, le=1)             # efficiency ratio above this: "trend" stock
+    revert_autocorr: float = Field(-0.05, ge=-1, le=0)    # lag-1 autocorrelation below this: "mean-reverting"
+    max_tilt: float = Field(0.5, ge=0, le=1)              # weight = base allocation x (1 +/- tilt)
+    rebalance_band: float = Field(0.25, ge=0, le=1)
+
+
 class IntradayCfg(BaseModel):
     """Intraday decisions (aaba/intraday.py). Off by default: the daily strategy is unchanged."""
     enabled: bool = False
-    engine: Literal["v1", "v2"] = "v1"                   # v1: rules + dips; v2: portfolio targets (aaba/portfolio.py)
+    engine: Literal["v1", "v2", "v3"] = "v1"             # v1 rules+dips; v2 momentum portfolio; v3 adaptive per stock
     cycle_minutes: int = Field(10, ge=5, le=60)          # re-evaluate every N minutes in the session
     bar_minutes: int = Field(5, ge=1, le=30)             # completed intraday candles of this length
     first_cycle: str = "09:50"                           # New York time
@@ -229,6 +249,7 @@ class StrategyConfig(BaseModel):
     agent: AgentCfg = AgentCfg()
     intraday: IntradayCfg = IntradayCfg()
     portfolio: PortfolioCfg = PortfolioCfg()
+    adaptive: AdaptiveCfg = AdaptiveCfg()
     reports: ReportCfg = ReportCfg()
 
 

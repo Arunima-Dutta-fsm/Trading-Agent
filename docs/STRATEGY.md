@@ -172,3 +172,19 @@ but there: only LIMIT orders with `extended_hours=true` and time-in-force `day`/
 market, stop, bracket orders are rejected and trailing stops do not trigger; overnight needs an
 `overnight_tradable` asset and a separate data feed and does not run before market holidays; liquidity
 is thin and spreads wide. The agent's orders are market orders, so it does not trade off-hours.
+## Engine v3: stock-specific adaptive strategy (`intraday.engine: "v3"`)
+
+Code: `aaba/adaptive.py`; settings: the `adaptive` section; frozen parameters: `configs/v3_frozen.json`.
+
+Each stock gets a daily profile from its own trailing history: normal pullback depth (90th percentile
+drop from the 20-day high, in ATR), efficiency ratio and return autocorrelation, giving a style
+(trend / mean_revert / steady) and a stock-specific trailing stop. Exits need `confirm_days`
+consecutive closes beyond that stop AND a weakening trend; a weak stock (below EMA200 with negative
+120-session momentum) is exited; a loss cap from the entry always applies. Held stocks keep their place
+while their long-term trend holds (deliberate holding); after a sale there is a cooldown unless a new
+20-day high. Mean-reverting stocks are only bought at or below VWAP.
+
+Validation protocol: parameters chosen ONLY on 15 Oct 2025 - 16 Apr 2026 (32 combinations, best
+combined Sharpe), frozen in `configs/v3_frozen.json`, then evaluated once on 17 Apr - 15 Oct 2026.
+Reproduce with `python main.py backtest-v3`. On that unseen window v3 did NOT beat buy-and-hold of the
+same stocks or SPY (see the evaluation results in the project report); it is off by default.

@@ -246,15 +246,27 @@ def _intraday_signal(s: RunState, student: StudentConfig, sym: str, cat: str, da
     return d.action, d.reasons, ev, d.price
 
 
-def _v2_targets(s: RunState, student: StudentConfig) -> dict:
-    """Engine v2: regime (once per run) and this student's momentum/volatility targets."""
-    from . import portfolio
+def _v2_targets(s: RunState, student: StudentConfig, held: set[str] | None = None) -> dict:
+    """Engines v2/v3: regime (once per run) and this student's targets."""
+    from . import adaptive, portfolio
     cols = colnames(s.cfg.indicators)
     if s.regime is None:
         s.regime = portfolio.market_regime(s.frames, load_students().all_symbols, cols, s.cfg)
-        db.log_event("INFO", "regime", f"market regime {s.regime['label']} (invest {s.regime['gross']:.0%}): "
-                                       f"{s.regime['why']}", s.run_id)
+        db.log_event("INFO", "regime", f"market regime {s.regime['label']}: {s.regime['why']}", s.run_id)
+    if s.cfg.intraday.engine == "v3":
+        return adaptive.compute_targets(student, s.frames, s.news, cols, s.cfg, s.regime, held=held or set())
     return portfolio.compute_targets(student, s.frames, s.news, cols, s.cfg, s.regime)
+
+
+def _sessions_since_exit(student_id: str, symbol: str, today) -> int | None:
+    """Trading days (weekdays) since this stock was last sold, from the order history."""
+    import numpy as np
+    row = db.q1("SELECT MAX(submitted_at) AS t FROM orders WHERE student_id=? AND symbol=? AND side='sell' "
+                "AND filled_qty>0", (student_id, symbol))
+    if not row or not row.get("t"):
+        return None
+    sold = clock.to_ny(clock.parse_iso(row["t"])).date()
+    return int(np.busday_count(sold, today))
 
 
 def _v2_signal(s: RunState, student: StudentConfig, sym: str, daily_sig, position, live, targets) -> tuple:
@@ -275,8 +287,13 @@ def _v2_signal(s: RunState, student: StudentConfig, sym: str, daily_sig, positio
     daily_close = float(frame["close"].iloc[-1]) if frame is not None and not frame.empty else 0.0
     price = float(bar["close"]) if bar is not None else daily_close
     hold = portfolio.Holding(value=qty * price, highest_close=position.highest_close_since_entry)
-    d = portfolio.decide_v2(sym, s.cfg, targets.get(sym, {}), daily_close, bar, plan, hold,
-                            intra.market_context(spy_bar, s.spy_prev_close))
+    market = intra.market_context(spy_bar, s.spy_prev_close)
+    if s.cfg.intraday.engine == "v3":
+        from . import adaptive
+        d = adaptive.decide_v3(sym, s.cfg, targets.get(sym, {}), bar, plan, hold, market,
+                               _sessions_since_exit(student.student_id, sym, s.clock.timestamp.date()))
+    else:
+        d = portfolio.decide_v2(sym, s.cfg, targets.get(sym, {}), daily_close, bar, plan, hold, market)
     ev = dict(daily_sig.evidence)
     ev["v2"] = d.evidence
     ev["regime"] = s.regime
@@ -361,8 +378,8 @@ def evaluate_student(run_id: str, student_id: str) -> dict:
     created = clock.iso()
     # engine v2: regime and targets BEFORE the write transaction below (they log an event, which
     # needs its own connection and would wait forever for this transaction's write lock)
-    v2_targets = (_v2_targets(s, student) if s.cfg.intraday.enabled and s.cfg.intraday.engine == "v2"
-                  and s.intraday_fresh else None)
+    v2_targets = (_v2_targets(s, student, {k for k, v in live_positions.items() if float(v.get("qty") or 0) > 0})
+                  if s.cfg.intraday.enabled and s.cfg.intraday.engine in ("v2", "v3") and s.intraday_fresh else None)
     with db.tx() as con:
         for sym in student.symbols:
             cat = student.category(sym)
@@ -373,7 +390,7 @@ def evaluate_student(run_id: str, student_id: str) -> dict:
             if s.cfg.intraday.enabled:
                 if not s.intraday_fresh:
                     action, reasons = "HOLD", [f"intraday decision paused: {s.intraday_note}"] + reasons
-                elif s.cfg.intraday.engine == "v2":
+                elif s.cfg.intraday.engine in ("v2", "v3"):
                     if v2_targets is None:
                         v2_targets = _v2_targets(s, student)
                     action, reasons, ev_override, ip = _v2_signal(s, student, sym, sig, positions[sym],
@@ -546,7 +563,7 @@ def _buy_check(sig: dict, s: RunState):
                      entries=plan.entries, last_entry_price=plan.last_entry_price,
                      minutes_since_last_entry=plan.minutes_since_last_entry,
                      buys_today_student=plan.buys_today_student, sell_pending=plan.sell_pending)
-        if s.cfg.intraday.engine == "v2" and ev.get("target_value") is not None:
+        if s.cfg.intraday.engine in ("v2", "v3") and ev.get("target_value") is not None:
             extra.update(target_value=float(ev["target_value"]),
                          buy_value=float(ev["buy_value"]) if ev.get("buy_value") is not None else None)
     ctx = BuyContext(student=student, cfg=s.cfg, symbol=sym, category=sig["category"], signal_action=sig["action"],

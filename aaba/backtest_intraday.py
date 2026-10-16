@@ -87,8 +87,10 @@ def _bar_at_or_after(day_data, t_utc):
 
 def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: StrategyConfig, days: list,
                       approval_delay_min: int = 30, engine: str = "v1") -> dict:
+    from . import adaptive as ad
     from . import portfolio as pf
     ic, rk, pc = cfg.intraday, cfg.risk, cfg.portfolio
+    targeted = engine in ("v2", "v3")
     universe = load_students().all_symbols
     cols = colnames(cfg.indicators)
     cost = ic.cost_bps / 10_000
@@ -97,7 +99,8 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
     pos: dict[str, dict] = {}
     pending_sell: dict[str, tuple] = {}        # sym -> (execute_at_utc, reason)
     equity, closed, log, invested = [], [], [], []
-    stats = {"buys": 0, "adds": 0, "sell_requests": 0, "sells": 0, "fees": 0.0}
+    stats = {"buys": 0, "adds": 0, "sell_requests": 0, "sells": 0, "fees": 0.0, "slippage": 0.0}
+    last_exit: dict[str, int] = {}                 # symbol -> session number of the last SELL fill
     didx = {s: {ts.date() if hasattr(ts, "date") else ts: i for i, ts in
                 enumerate(f["timestamp"].dt.tz_convert("America/New_York"))} for s, f in daily.items()}
     spy_daily = daily.get("SPY")
@@ -110,6 +113,8 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
         nonlocal cash
         p = pos.pop(sym)
         px = float(row["open"]) * (1 - cost)
+        stats["slippage"] += p["qty"] * float(row["open"]) * cost
+        last_exit[sym] = day_no
         fee = _sell_fees(p["qty"], px)
         cash += p["qty"] * px - fee
         stats["fees"] += fee
@@ -119,7 +124,7 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
         log.append({"t": str(row["timestamp"]), "symbol": sym, "side": "sell", "qty": p["qty"], "price": round(px, 2),
                     "pnl": round(pnl, 2), "why": why[:120]})
 
-    for day in days:
+    for day_no, day in enumerate(days):
         d = day.date() if hasattr(day, "date") else day
         # SELLs approved overnight fill at today's first candle
         for sym, (at, why) in list(pending_sell.items()):
@@ -142,11 +147,12 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
             dsig[sym] = evaluate_symbol(hist, sym, student.category(sym), cfg, position)
             ctxs[sym] = daily_context(hist, cols)
         targets = {}
-        if engine == "v2":
+        if targeted:
             hist_all = {s: daily[s].iloc[:didx[s][d]] for s in set(universe) | {"SPY"}
                         if s in daily and didx[s].get(d)}
             regime = pf.market_regime(hist_all, universe, cols, cfg)
-            targets = pf.compute_targets(student, hist_all, {}, cols, cfg, regime)
+            targets = (pf.compute_targets(student, hist_all, {}, cols, cfg, regime) if engine == "v2" else
+                       ad.compute_targets(student, hist_all, {}, cols, cfg, regime, held=set(pos)))
             stats.setdefault("regimes", {})
             stats["regimes"][regime["label"]] = stats["regimes"].get(regime["label"], 0) + 1
         spy_prev = None
@@ -193,6 +199,11 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                     hold = pf.Holding(value=(p["qty"] * float(bar["close"])) if p else 0.0,
                                       highest_close=p.get("hi") if p else None)
                     dec = pf.decide_v2(sym, cfg, targets.get(sym, {}), daily_close, bar, plan, hold, market)
+                elif engine == "v3":
+                    hold = pf.Holding(value=(p["qty"] * float(bar["close"])) if p else 0.0,
+                                      highest_close=p.get("hi") if p else None)
+                    dec = ad.decide_v3(sym, cfg, targets.get(sym, {}), bar, plan, hold, market,
+                                       day_no - last_exit[sym] if sym in last_exit else None)
                 else:
                     dec = decide(sym, student.category(sym), cfg, ctxs[sym], bar, sig.action if sig else "HOLD",
                                  list(sig.reasons) if sig else [], [], market, plan)
@@ -205,7 +216,7 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                         continue
                     px = float(row["open"]) * (1 + cost)
                     held_val = p["qty"] * px if p else 0.0
-                    if engine == "v2":
+                    if targeted:
                         tgt = targets.get(sym, {}).get("target_value", 0.0)
                         room = min(tgt - held_val, dec.evidence.get("buy_value") or 0.0)
                     else:
@@ -214,8 +225,8 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                     room = min(room, cap_val - held_val, cash)
                     q_room = int(room // px) if room > 0 else 0
                     q_risk = risk_qty(cfg, student.starting_capital, px, dec.stop, p["qty"] if p else 0,
-                                      p["avg"] if p else None, "add" if engine == "v2" else dec.kind,
-                                      budget_pct=pc.max_position_risk_pct if engine == "v2" else None)
+                                      p["avg"] if p else None, "add" if targeted else dec.kind,
+                                      budget_pct=pc.max_position_risk_pct if targeted else None)
                     qty = min(q_room, q_risk)
                     if qty < 1 or qty * px < rk.min_order_value or px <= dec.stop:
                         continue
@@ -229,6 +240,7 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
                                     "hi": px}
                         stats["buys"] += 1
                     cash -= qty * px
+                    stats["slippage"] += qty * float(row["open"]) * cost
                     buys_today += 1
                     buys_cycle += 1
                     log.append({"t": str(row["timestamp"]), "symbol": sym, "side": "buy", "kind": dec.kind,
@@ -240,7 +252,7 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
             dd = intra.get(sym, {}).get(d)
             if dd:
                 last_px[sym] = float(dd[1][-1]["close"])
-                if engine == "v2":
+                if targeted:
                     pos[sym]["hi"] = max(pos[sym].get("hi") or 0.0, last_px[sym])
         v = mark()
         invested.append(1 - cash / v if v else 0.0)
@@ -248,10 +260,52 @@ def simulate_intraday(daily: dict, intra: dict, student: StudentConfig, cfg: Str
     eq = pd.Series([v for _, v in equity], index=[d for d, _ in equity])
     m = daily_bt._metrics(eq, closed, stats["buys"] + stats["adds"])
     return {"metrics": m.as_dict(), "stats": {**stats, "fees": round(stats["fees"], 2),
+                                               "slippage": round(stats["slippage"], 2),
+                                               "costs_total": round(stats["fees"] + stats["slippage"], 2),
                                                "open_positions_at_end": len(pos),
                                                "avg_invested_pct": round(100 * sum(invested) / len(invested), 1)
                                                if invested else 0.0},
             "equity": eq, "trades": log}
+
+
+def cached_data(cfg: StrategyConfig, symbols: list[str], first, last, provider=None):
+    """load_data(), optionally cached in the file named by AABA_BACKTEST_CACHE (skips the long download)."""
+    import os
+    import pickle
+    provider = provider or get_provider()
+    cache = os.getenv("AABA_BACKTEST_CACHE", "").strip()
+    key = (tuple(symbols), str(first), str(last), cfg.intraday.bar_minutes, bool(getattr(provider, "simulated", 0)))
+    if cache and os.path.exists(cache):
+        with open(cache, "rb") as fh:
+            c = pickle.load(fh)
+        if c.get("key") == key:
+            return c["data"]
+    loaded = load_data(cfg, symbols, first, last, provider)
+    if cache:
+        with open(cache, "wb") as fh:
+            pickle.dump({"key": key, "data": loaded}, fh)
+    return loaded
+
+
+def default_windows(provider=None, cfg: StrategyConfig | None = None) -> list[tuple]:
+    """[(label, first, last)]: the last 126 completed sessions and the 126 before them."""
+    provider = provider or get_provider()
+    cfg = cfg or load_strategy()
+    spy = provider.daily_bars(["SPY"], DataCfg(history_days=400, feed=cfg.data.feed)).bars
+    mclock = provider.market_clock()
+    sessions = provider.sessions(mclock.timestamp.date() - timedelta(days=10), mclock.timestamp.date())
+    spy, _ = drop_incomplete_bars(spy, sessions, mclock.timestamp)
+    days = list(spy["timestamp"].dt.tz_convert("America/New_York").dt.normalize())
+    a, b = days[-126:], days[-252:-126]
+    return [("recent 6 months", a[0].date(), a[-1].date()), ("previous 6 months", b[0].date(), b[-1].date())]
+
+
+def window_days(daily: dict, intra: dict, first, last) -> tuple[list, list]:
+    """(New York session days, the matching daily-bar timestamps) inside [first, last]."""
+    ts = daily["SPY"]["timestamp"]
+    ny = ts.dt.tz_convert("America/New_York").dt.normalize()
+    keep = [(d, t) for d, t in zip(ny, ts) if first <= d.date() <= last and d.date() in intra.get("SPY", {})]
+    return [d for d, _ in keep], [t for _, t in keep]
 
 
 def _series_metrics(eq: pd.Series) -> dict:
@@ -278,21 +332,7 @@ def run_comparison(windows: list[tuple] | None = None, approval_delay_min: int =
         windows = [("recent 6 months", a[0].date(), a[-1].date()), ("previous 6 months", b[0].date(), b[-1].date())]
     first = min(w[1] for w in windows)
     last = max(w[2] for w in windows)
-    import os
-    import pickle
-    cache = os.getenv("AABA_BACKTEST_CACHE", "").strip()       # optional local file: skip the long download
-    key = (tuple(symbols), str(first), str(last), cfg.intraday.bar_minutes, bool(getattr(provider, "simulated", 0)))
-    loaded = None
-    if cache and os.path.exists(cache):
-        with open(cache, "rb") as fh:
-            c = pickle.load(fh)
-        loaded = c["data"] if c.get("key") == key else None
-    if loaded is None:
-        loaded = load_data(cfg, symbols, first, last, provider)
-        if cache:
-            with open(cache, "wb") as fh:
-                pickle.dump({"key": key, "data": loaded}, fh)
-    daily, intra, meta = loaded
+    daily, intra, meta = cached_data(cfg, symbols, first, last, provider)
     out = {"meta": meta | {"simulated": bool(getattr(provider, "simulated", False)),
                            "approval_delay_min": approval_delay_min, "cost_bps_each_way": cfg.intraday.cost_bps,
                            "settings": cfg.intraday.model_dump()}, "windows": {}}

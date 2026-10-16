@@ -187,6 +187,18 @@ def cmd_backtest_intraday(a):
     print("\nsaved:", r["file"])
 
 
+def cmd_backtest_v3(_):
+    from aaba.backtest_v3 import run
+    print("Engine v3: tune on 15 Oct 2025-16 Apr 2026, freeze, evaluate once on 17 Apr-15 Oct 2026 (sends no orders)")
+    r = run()
+    fz = r["frozen"]
+    print("chosen on the tuning window:", fz["chosen"])
+    for k, m in r["combined"].items():
+        print(f"  {k:<15} return {m['total_return_pct']:>7}%  max drawdown {m['max_drawdown_pct']:>7}%  "
+              f"Sharpe {m['sharpe']:>5}  costs ${m['costs_total']:,.0f}")
+    print("saved:", r["file"])
+
+
 def cmd_reconcile(_):
     from aaba import controller
     db.init_db()
@@ -261,6 +273,7 @@ def main():
     p = sub.add_parser("backtest-intraday")
     p.add_argument("--approval-delay", type=int, default=30, help="minutes until a SELL request is approved")
     p.set_defaults(fn=cmd_backtest_intraday)
+    sub.add_parser("backtest-v3").set_defaults(fn=cmd_backtest_v3)
     sub.add_parser("reconcile").set_defaults(fn=cmd_reconcile)
     sub.add_parser("llm-test").set_defaults(fn=cmd_llm_test)
     p = sub.add_parser("mcp-test")
