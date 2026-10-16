@@ -31,7 +31,8 @@ def check() -> tuple[bool, dict]:
     from alpaca.trading.enums import QueryOrderStatus
     from alpaca.trading.requests import GetOrdersRequest
 
-    env = dotenv_values(ROOT / ".env")
+    import os
+    env = dotenv_values(os.getenv("AABA_ENV_FILE") or (ROOT / ".env"))   # server: /etc/aaba/engine.env
     out, ok = {}, True
     for sid, pre in PREFIX.items():
         r = {"problems": [], "pinned": False}
