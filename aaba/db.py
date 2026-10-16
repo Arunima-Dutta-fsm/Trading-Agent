@@ -8,6 +8,7 @@ mixed into another's view. Data survives restarts because it lives in a file
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -168,10 +169,27 @@ CREATE INDEX IF NOT EXISTS ix_snapshots_student ON snapshots(student_id, at);
 """
 
 
+def _share_with_group(p) -> None:
+    """On the server the scheduler (user aaba) and the dashboard (user aabaweb) share the database
+    through the 'aabadata' group. SQLite creates files as 0644 and gives its -wal/-shm files the
+    database file's mode, so the database must be group-writable or a restart can leave the
+    trading process unable to write ('attempt to write a readonly database')."""
+    if os.name != "posix":
+        return
+    for f in (p, p.with_name(p.name + "-wal"), p.with_name(p.name + "-shm")):
+        try:
+            st = f.stat()
+            if st.st_uid == os.getuid() and not st.st_mode & 0o020:
+                os.chmod(f, st.st_mode | 0o060)
+        except OSError:
+            pass
+
+
 def connect() -> sqlite3.Connection:
     p = paths.db_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(p, timeout=30, isolation_level=None)  # autocommit; explicit BEGIN for multi-step
+    _share_with_group(p)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=30000")
