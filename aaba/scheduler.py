@@ -14,6 +14,7 @@ the US daylight-saving change (1 Nov 2026) is handled automatically. In India,
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from . import clock, controller, db, demo, monitoring, paths
 from .market_data import get_provider
@@ -69,6 +70,42 @@ def daily_job(trigger: str = "scheduler"):
     except Exception as e:  # noqa: BLE001
         db.log_event("ERROR", "scheduler", f"run failed: {type(e).__name__}: {e}")
         monitoring.ping(DAILY, "fail", f"run failed: {type(e).__name__}")
+
+
+def intraday_job():
+    """One intraday decision cycle (cfg.intraday): fresh candles, fresh decisions, BUYs that pass
+    every check, SELL approval requests. Runs only inside the configured window on an open market."""
+    demo.guard("starting intraday cycles")
+    from datetime import time as dtime
+    cfg = load_strategy()
+    ic = cfg.intraday
+    if not ic.enabled:
+        return "intraday disabled"
+    try:
+        now_ny, sess = _today_session()
+        is_open = get_provider().market_clock().is_open
+    except Exception as e:  # noqa: BLE001
+        db.log_event("ERROR", "scheduler", f"intraday cycle: calendar check failed: {type(e).__name__}: {e}")
+        return "calendar check failed"
+    first, last = (dtime(*map(int, t.split(":"))) for t in (ic.first_cycle, ic.last_cycle))
+    if not sess or not is_open:
+        return "market closed"
+    if not first <= now_ny.time() <= last or now_ny >= sess.close - timedelta(minutes=10):
+        return "outside the intraday window"
+    from agents.trading_crew import run_workflow
+    try:
+        res = run_workflow(cfg.schedule.mode, "intraday")
+        log.info("intraday cycle %s: %s", res["run_id"], res["status"])
+        if res["status"] != "DONE":
+            monitoring.ping(DAILY, "fail", f"intraday cycle {res['run_id']} {res['status']}")
+        return res["status"]
+    except RunLocked:
+        db.log_event("INFO", "scheduler", "intraday cycle skipped: another run is in progress")
+        return "skipped: locked"
+    except Exception as e:  # noqa: BLE001
+        db.log_event("ERROR", "scheduler", f"intraday cycle failed: {type(e).__name__}: {e}")
+        monitoring.ping(DAILY, "fail", f"intraday cycle failed: {type(e).__name__}")
+        return "failed"
 
 
 def catch_up_if_missed() -> str:
@@ -158,9 +195,13 @@ def start():
                       id=f"daily-{t}", max_instances=1, coalesce=True, misfire_grace_time=900)
     sched.add_job(approved_sell_job, IntervalTrigger(minutes=cfg.schedule.approved_sell_check_minutes, timezone=tz),
                   id="approved-sells", max_instances=1, coalesce=True)
+    if cfg.intraday.enabled:
+        sched.add_job(intraday_job, CronTrigger(day_of_week="mon-fri", hour="9-15",
+                                                minute=f"*/{cfg.intraday.cycle_minutes}", timezone=tz),
+                      id="intraday", max_instances=1, coalesce=True, misfire_grace_time=120)
     # after a restart, run today's workflow if it was missed (checked once, 30 s after start)
     from apscheduler.triggers.date import DateTrigger
-    from datetime import datetime, timedelta
+    from datetime import datetime
     sched.add_job(catch_up_if_missed, DateTrigger(run_date=datetime.now(sched.timezone) + timedelta(seconds=30)),
                   id="catch-up", max_instances=1)
     db.log_event("INFO", "scheduler", f"started: runs at {cfg.schedule.run_times} {tz}, mode={cfg.schedule.mode}")

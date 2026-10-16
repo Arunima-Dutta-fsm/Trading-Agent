@@ -11,6 +11,7 @@
     python main.py approvals                 list pending SELL approvals
     python main.py approve <id> --student S2 [--reject]   decide a SELL (asks for the PIN)
     python main.py backtest --student S2     walk-forward backtest (all students if omitted)
+    python main.py backtest-intraday         10-minute intraday engine vs daily strategy, buy-and-hold, SPY
     python main.py reconcile                 refresh order statuses and save snapshots
     python main.py mcp-test                  start the MCP server, list tools and call one
     python main.py llm-test                  check the LLM answers and can call tools (needed by the agent)
@@ -174,6 +175,18 @@ def cmd_backtest(a):
         print("  saved:", *r["files"])
 
 
+def cmd_backtest_intraday(a):
+    from aaba.backtest_intraday import run_comparison
+    print("Intraday backtest on real 5-minute history (several minutes; sends no orders)...")
+    r = run_comparison(approval_delay_min=a.approval_delay)
+    for label, w in r["windows"].items():
+        print(f"\n{label}: {w['period'][0]} to {w['period'][1]} ({w['sessions']} sessions), all three students combined")
+        for k, m in w["combined"].items():
+            print(f"  {k:<18} return {m['total_return_pct']:>7}%   max drawdown {m['max_drawdown_pct']:>7}%   "
+                  f"Sharpe {m['sharpe']:>6}")
+    print("\nsaved:", r["file"])
+
+
 def cmd_reconcile(_):
     from aaba import controller
     db.init_db()
@@ -245,6 +258,9 @@ def main():
     p.add_argument("--student")
     p.add_argument("--no-tune", action="store_true")
     p.set_defaults(fn=cmd_backtest)
+    p = sub.add_parser("backtest-intraday")
+    p.add_argument("--approval-delay", type=int, default=30, help="minutes until a SELL request is approved")
+    p.set_defaults(fn=cmd_backtest_intraday)
     sub.add_parser("reconcile").set_defaults(fn=cmd_reconcile)
     sub.add_parser("llm-test").set_defaults(fn=cmd_llm_test)
     p = sub.add_parser("mcp-test")

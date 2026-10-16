@@ -75,6 +75,18 @@ def _retry(fn, what: str, attempts: int = 3):
     raise last  # pragma: no cover
 
 
+def completed_regular_bars(df: pd.DataFrame, bar_minutes: int, now: datetime) -> pd.DataFrame:
+    """Keep only intraday candles that lie inside regular hours (09:30-16:00 New York) and have
+    already CLOSED by `now` (a candle stamped 10:05 with 5-minute bars closes at 10:10)."""
+    if df.empty:
+        return df
+    ts_ny = df["timestamp"].dt.tz_convert("America/New_York")
+    minutes = ts_ny.dt.hour * 60 + ts_ny.dt.minute
+    inside = (minutes >= 9 * 60 + 30) & (minutes + bar_minutes <= 16 * 60)
+    closed = df["timestamp"] + pd.Timedelta(minutes=bar_minutes) <= pd.Timestamp(now)
+    return df[inside & closed].sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+
+
 def data_keys() -> tuple[str, str]:
     """Market data is not account specific. Use DATA_ALPACA_* if set, else the first
     student account that has keys."""
@@ -140,6 +152,26 @@ class AlpacaMarketData:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         # one request for all symbols (alpaca-py follows page tokens inside this one call)
         return BarsResult(df, self.name, feed, 1, notes)
+
+    def intraday_bars(self, symbols: list[str], bar_minutes: int, lookback_days: int, feed: str = "iex",
+                      start: datetime | None = None, end: datetime | None = None) -> BarsResult:
+        """Completed regular-hours candles for all symbols in ONE batch request (pages followed)."""
+        from alpaca.data.enums import Adjustment, DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        now = clock.now_utc()
+        start = start or now - timedelta(days=lookback_days * 2 + 4)       # weekends and holidays
+        if end is None and feed == "sip":
+            end = now - timedelta(minutes=16)                               # free SIP is 15 minutes late
+        req = StockBarsRequest(symbol_or_symbols=sorted(set(symbols)), timeframe=TimeFrame(bar_minutes, TimeFrameUnit.Minute),
+                               start=start, end=end, adjustment=Adjustment.SPLIT,
+                               feed=DataFeed.SIP if feed == "sip" else DataFeed.IEX)
+        resp = _retry(lambda: self._data.get_stock_bars(req), "intraday batch bars")
+        df = resp.df.reset_index() if hasattr(resp, "df") else pd.DataFrame()
+        if df.empty:
+            return BarsResult(pd.DataFrame(columns=["symbol", "timestamp"]), self.name, feed, 1, ["no intraday bars"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return BarsResult(completed_regular_bars(df, bar_minutes, end or now), self.name, feed, 1, [])
 
     def latest_prices(self, symbols: list[str]) -> dict[str, LatestPrice]:
         from alpaca.data.enums import DataFeed
@@ -233,6 +265,42 @@ class SyntheticMarketData:
         df = pd.concat(frames, ignore_index=True)
         df = df[df["timestamp"] >= start].reset_index(drop=True)
         return BarsResult(df, self.name, "synthetic", 1, ["SIMULATED DATA - not real prices"])
+
+    def intraday_bars(self, symbols: list[str], bar_minutes: int, lookback_days: int, feed: str = "synthetic",
+                      start: datetime | None = None, end: datetime | None = None) -> BarsResult:
+        """SIMULATED regular-hours candles: for each session a deterministic path from that day's
+        simulated open to its close (a Brownian bridge), so daily and intraday data agree."""
+        now = end or self.now()
+        now_ny = clock.to_ny(now)
+        days = [s for s in self.sessions(now_ny.date() - timedelta(days=lookback_days * 2 + 4), now_ny.date())
+                if s.open <= now_ny][-lookback_days:]
+        n = 390 // bar_minutes
+        frames = []
+        for sym in sorted(set(symbols)):
+            daily = self._series(sym, now_ny.date()).set_index("timestamp")
+            for s in days:
+                key = pd.Timestamp(datetime(s.date.year, s.date.month, s.date.day, tzinfo=clock.NY)).tz_convert("UTC")
+                if key not in daily.index:
+                    continue
+                d = daily.loc[key]
+                rng = np.random.default_rng(self._seed(f"{sym}|{s.date}|{bar_minutes}"))
+                steps = rng.normal(0, 1, n)
+                walk = np.concatenate([[0.0], np.cumsum(steps)])
+                t = np.linspace(0, 1, n + 1)
+                bridge = walk - t * walk[-1]
+                scale = max(abs(d["high"] - d["low"]), 0.01 * d["close"]) / (4 * max(np.abs(bridge).max(), 1e-9))
+                path = d["open"] + (d["close"] - d["open"]) * t + bridge * scale
+                o, c = path[:-1], path[1:]
+                wig = np.abs(rng.normal(0, scale * 0.3, (2, n)))
+                ts = [s.open + timedelta(minutes=bar_minutes * i) for i in range(n)]
+                shape = 1.5 - np.sin(np.linspace(0, np.pi, n))           # more volume at the open and close
+                frames.append(pd.DataFrame({
+                    "symbol": sym, "timestamp": pd.to_datetime(ts).tz_convert("UTC"), "open": o,
+                    "high": np.maximum(o, c) + wig[0], "low": np.maximum(np.minimum(o, c) - wig[1], 0.01),
+                    "close": c, "volume": d["volume"] / n * shape / shape.mean()}))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["symbol", "timestamp"])
+        return BarsResult(completed_regular_bars(df, bar_minutes, now) if not df.empty else df, self.name,
+                          "synthetic", 1, ["SIMULATED DATA - not real prices"])
 
     def latest_prices(self, symbols: list[str]) -> dict[str, LatestPrice]:
         """The last simulated close (today's bar if it exists) stamped with the simulated 'now'."""

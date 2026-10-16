@@ -49,6 +49,11 @@ class RunState:
     accounts: dict = field(default_factory=dict)
     symbol_problems: dict = field(default_factory=dict)
     provider: object = None
+    # intraday mode: features of completed 5-minute candles per symbol, SPY's prior close
+    intraday: dict = field(default_factory=dict)
+    spy_prev_close: float | None = None
+    intraday_fresh: bool = True
+    intraday_note: str = ""
 
 
 _RUNS: dict[str, RunState] = {}
@@ -123,6 +128,8 @@ def prepare_market_data(run_id: str) -> dict:
 
     state = RunState(run_id, run["mode"], cfg, mclock, sessions, frames, fresh,
                      str(expected) if expected else None, prices, news, earn, accounts, problems, provider)
+    if cfg.intraday.enabled:
+        _load_intraday(state, symbols, notes)
     _RUNS[run_id] = state
 
     # save indicator CSVs (same columns as the old project) for audit and for get_latest_indicators
@@ -149,6 +156,93 @@ def prepare_market_data(run_id: str) -> dict:
                  f"{len(frames)} symbols loaded in {result.batch_calls} batch request(s); fresh={fresh}",
                  run_id, None, {"problems": problems, "notes": notes})
     return _snapshot_summary(state, cached=False, notes=notes, batch_calls=result.batch_calls)
+
+
+def _load_intraday(state: RunState, symbols: list[str], notes: list[str]) -> None:
+    """One batch request for completed 5-minute candles of every symbol, then the features."""
+    from .intraday import add_intraday_features
+    ic = state.cfg.intraday
+    try:
+        res = state.provider.intraday_bars(symbols, ic.bar_minutes, ic.lookback_days, ic.feed)
+    except Exception as e:  # noqa: BLE001
+        state.intraday_fresh, state.intraday_note = False, f"intraday bars unavailable: {type(e).__name__}"
+        notes.append(state.intraday_note)
+        return
+    bars = res.bars
+    newest = None
+    for sym in symbols:
+        g = bars[bars["symbol"] == sym] if not bars.empty else bars
+        if not g.empty:
+            state.intraday[sym] = add_intraday_features(g, ic.bar_minutes)
+            last = g["timestamp"].max() + pd.Timedelta(minutes=ic.bar_minutes)
+            newest = last if newest is None else max(newest, last)
+    spy = state.frames.get(BENCHMARK)
+    state.spy_prev_close = float(spy["close"].iloc[-1]) if spy is not None and not spy.empty else None
+    if state.clock.is_open:
+        age = (pd.Timestamp(state.provider.now()) - newest).total_seconds() / 60 if newest is not None else None
+        state.intraday_fresh = age is not None and age <= ic.max_bar_age_minutes
+        state.intraday_note = (f"newest completed {ic.bar_minutes}-min candle closed {age:.0f} min ago"
+                               if age is not None else "no intraday candles")
+    else:
+        state.intraday_fresh, state.intraday_note = False, "market closed: intraday decisions paused"
+    notes.append(f"intraday ({res.feed}, {res.batch_calls} batch request): {state.intraday_note}")
+
+
+def position_plan(student_id: str, symbol: str, live_qty: float, live_avg: float | None, now_utc) -> "PositionPlan":
+    """Entries of the CURRENT position (BUY orders since the last filled SELL), its anchored stop and
+    timing, read from the order history so it survives restarts."""
+    import json
+    from .intraday import PositionPlan
+    live_bad = ("SUBMIT_ERROR", "PRECHECK_ERROR", "rejected", "canceled", "expired")
+    last_sell = db.q1("SELECT MAX(submitted_at) AS t FROM orders WHERE student_id=? AND symbol=? AND side='sell'"
+                      " AND filled_qty>0", (student_id, symbol))
+    since = (last_sell or {}).get("t") or "1970-01-01"
+    marks = ",".join("?" * len(live_bad))
+    buys = db.q(f"SELECT o.*, s.indicators AS sig_ind FROM orders o LEFT JOIN signals s ON s.signal_id=o.signal_id"
+                f" WHERE o.student_id=? AND o.symbol=? AND o.side='buy' AND o.submitted_at>? AND o.status NOT IN ({marks})"
+                f" ORDER BY o.submitted_at", (student_id, symbol, since, *live_bad))
+    plan = PositionPlan(qty=live_qty, avg_cost=live_avg, entries=len(buys) if live_qty > 0 else 0)
+    if buys and live_qty > 0:
+        first, last = buys[0], buys[-1]
+        try:
+            plan.anchor_stop = json.loads(first["sig_ind"] or "{}").get("stop")
+        except ValueError:
+            plan.anchor_stop = None
+        plan.last_entry_price = last["filled_avg_price"] or last["est_price"]
+        plan.minutes_since_last_entry = (now_utc - clock.parse_iso(last["submitted_at"])).total_seconds() / 60
+    ny = clock.to_ny(now_utc)
+    start = clock.iso(datetime(ny.year, ny.month, ny.day, tzinfo=clock.NY).astimezone(clock.UTC))
+    plan.buys_today_student = (db.q1(f"SELECT COUNT(*) AS n FROM orders WHERE student_id=? AND side='buy' AND "
+                                     f"submitted_at>=? AND status NOT IN ({marks})", (student_id, start, *live_bad))
+                               or {}).get("n", 0)
+    plan.sell_pending = bool(db.q1("SELECT approval_id FROM approvals WHERE student_id=? AND symbol=? AND status IN "
+                                   "('PENDING','APPROVED','EXECUTING')", (student_id, symbol)))
+    return plan
+
+
+def _intraday_signal(s: RunState, student: StudentConfig, sym: str, cat: str, daily_sig, position, live) -> tuple:
+    """(action, reasons, evidence) for one stock this cycle."""
+    from . import intraday as intra
+    cols = colnames(s.cfg.indicators)
+    frame = s.frames.get(sym)
+    ctx = intra.daily_context(frame, cols) if frame is not None else None
+    feats = s.intraday.get(sym)
+    bar = feats.iloc[-1] if feats is not None and not feats.empty else None
+    if bar is not None and bar["session"] != s.clock.timestamp.date():
+        bar = None                                                   # no candle from today yet
+    spy = s.intraday.get(BENCHMARK)
+    spy_bar = spy.iloc[-1] if spy is not None and not spy.empty and spy.iloc[-1]["session"] == s.clock.timestamp.date() \
+        else None
+    p = live.get(sym, {})
+    plan = position_plan(student.student_id, sym, float(p.get("qty") or 0),
+                         float(p["avg_entry"]) if p.get("avg_entry") else None, clock.now_utc())
+    d = intra.decide(sym, cat, s.cfg, ctx, bar, daily_sig.action, list(daily_sig.reasons), list(daily_sig.blocked_by),
+                     intra.market_context(spy_bar, s.spy_prev_close), plan)
+    ev = dict(daily_sig.evidence)
+    ev["intraday"] = d.evidence
+    ev.update({"entry_kind": d.kind, "stop": d.stop, "target": d.target, "reward_risk": d.reward_risk,
+               "intraday_price": d.price})
+    return d.action, d.reasons, ev, d.price
 
 
 def _snapshot_summary(s: RunState, cached: bool, notes: list | None = None, batch_calls: int | None = None) -> dict:
@@ -231,6 +325,14 @@ def evaluate_student(run_id: str, student_id: str) -> dict:
             frame = s.frames.get(sym)
             sig = evaluate_symbol(frame, sym, cat, s.cfg, positions[sym], s.news.get(sym), s.earnings.get(sym), today)
             action, reasons = sig.action, list(sig.reasons)
+            sig_price, ev_override = sig.price, None
+            if s.cfg.intraday.enabled:
+                if not s.intraday_fresh:
+                    action, reasons = "HOLD", [f"intraday decision paused: {s.intraday_note}"] + reasons
+                else:
+                    action, reasons, ev_override, ip = _intraday_signal(s, student, sym, cat, sig, positions[sym],
+                                                                        live_positions)
+                    sig_price = ip or sig.price
             if action != "HOLD" and (not s.fresh or sym in s.symbol_problems):
                 reasons = [f"{action} setup ignored: market data not fresh "
                            f"({s.symbol_problems.get(sym, 'snapshot stale')})"] + reasons
@@ -239,7 +341,7 @@ def evaluate_student(run_id: str, student_id: str) -> dict:
                 reasons = [f"{action} setup ignored: {read_error}"] + reasons
                 action = "HOLD"
             outcome = "HOLD_RECORDED" if action == "HOLD" else None
-            ev = dict(sig.evidence)
+            ev = dict(ev_override if ev_override is not None else sig.evidence)
             ev["news"] = s.news.get(sym)
             ev["earnings"] = s.earnings.get(sym)
             ev["account_ok"] = acct.get("ok")
@@ -248,7 +350,7 @@ def evaluate_student(run_id: str, student_id: str) -> dict:
                 " indicators, price, bar_date, data_quality, news, held_qty, created_at, outcome, outcome_detail,"
                 " outcome_by, outcome_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (db.new_id("sig"), run_id, student_id, sym, cat, action, sig.score, db.j(reasons), db.j(ev),
-                 sig.price, sig.bar_date, sig.data_quality, db.j(s.news.get(sym)), positions[sym].qty, created,
+                 sig_price, sig.bar_date, sig.data_quality, db.j(s.news.get(sym)), positions[sym].qty, created,
                  outcome, "no order placed" if outcome else None, "code" if outcome else None,
                  created if outcome else None))
     rows = db.student_signals(student_id, run_id=run_id)
@@ -384,14 +486,24 @@ def _buy_check(sig: dict, s: RunState):
         asset = {"status": f"error {type(e).__name__}", "tradable": False}
     lp = s.prices.get(sym)
     ev = json.loads(sig["indicators"] or "{}")
+    positions = b.positions()
+    extra = {}
+    if s.cfg.intraday.enabled:
+        p = positions.get(sym, {})
+        plan = position_plan(sid, sym, float(p.get("qty") or 0), float(p["avg_entry"]) if p.get("avg_entry") else None,
+                             clock.now_utc())          # order timestamps are wall-clock
+        extra = dict(intraday=True, entry_kind=ev.get("entry_kind") or "initial", stop=ev.get("stop"),
+                     entries=plan.entries, last_entry_price=plan.last_entry_price,
+                     minutes_since_last_entry=plan.minutes_since_last_entry,
+                     buys_today_student=plan.buys_today_student, sell_pending=plan.sell_pending)
     ctx = BuyContext(student=student, cfg=s.cfg, symbol=sym, category=sig["category"], signal_action=sig["action"],
                      data_quality=sig["data_quality"], data_fresh=s.fresh and sym not in s.symbol_problems,
                      atr=ev.get(colnames(s.cfg.indicators)["atr"]), orders_allowed=bool(acct.get("orders_allowed")),
-                     asset=asset, account=account, positions=b.positions(), open_orders=b.open_orders(),
+                     asset=asset, account=account, positions=positions, open_orders=b.open_orders(),
                      latest_price=lp.price if lp else None, price_time=lp.timestamp if lp else None,
                      now=s.provider.now(), market_open=s.clock.is_open,
                      already_bought_today=_bought_today(sid, sym, s.clock.timestamp),
-                     buys_this_run=_buys_this_run(sig["run_id"], sid))
+                     buys_this_run=_buys_this_run(sig["run_id"], sid), **extra)
     return check_buy(ctx), student, b, account
 
 
@@ -435,7 +547,8 @@ def submit_buy(signal_id: str, agent_reason: str = "", actor: str = "agent") -> 
                          f"checks passed but ENABLE_PAPER_ORDERS is not true; nothing sent{note}", actor)
             return {"signal_id": signal_id, "symbol": sym, "result": "BLOCKED_ORDERS_DISABLED"}
         session = s.clock.timestamp.strftime("%Y%m%d")
-        cid = f"aaba-{sid}-{sym}-{session}-buy"
+        # daily mode: one BUY per stock per day; intraday mode: one order per decision (signal)
+        cid = f"aaba-{signal_id}-buy" if s.cfg.intraday.enabled else f"aaba-{sid}-{sym}-{session}-buy"
         res = place_order(student, b, symbol=sym, qty=rr.qty, side="buy", est_price=rr.est_price,
                           client_order_id=cid, run_id=run_id, mode=s.mode, signal_id=signal_id,
                           account_number=account.get("account_number"))
@@ -469,6 +582,14 @@ def create_sell_approval(signal_id: str, agent_reason: str = "", actor: str = "a
             _set_outcome(signal_id, "SELL_BLOCKED", "no shares held; nothing to sell", actor)
             return {"signal_id": signal_id, "symbol": sym, "result": "SELL_BLOCKED", "detail": "no shares held"}
         acct = s.accounts.get(sid, {})
+        open_ap = db.q1("SELECT approval_id, qty FROM approvals WHERE student_id=? AND symbol=? AND status IN "
+                        "('PENDING','APPROVED','EXECUTING') ORDER BY created_at DESC", (sid, sym))
+        if s.cfg.intraday.enabled and open_ap and abs(float(open_ap["qty"]) - held) < 1e-9:
+            # intraday cycles see the same exit again and again: keep the request the student already has
+            _set_outcome(signal_id, "SELL_PENDING_APPROVAL",
+                         f"SELL already waiting for {student.label}: approval {open_ap['approval_id']}", actor)
+            return {"signal_id": signal_id, "symbol": sym, "result": "SELL_PENDING_APPROVAL",
+                    "approval_id": open_ap["approval_id"], "qty": held, "approver": student.label, "existing": True}
         import json
         reasons = "; ".join(json.loads(sig["reasons"] or "[]"))
         reason = reasons + (f" | agent note: {agent_reason[:300]}" if agent_reason else "")

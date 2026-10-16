@@ -63,6 +63,16 @@ class BuyContext:
     market_open: bool
     already_bought_today: bool
     buys_this_run: int
+    # intraday mode (cfg.intraday.enabled): scaling in is allowed under these rules instead of
+    # "one BUY per stock per day"
+    intraday: bool = False
+    entry_kind: str = "initial"              # initial / add
+    stop: float | None = None                # the decision's stop (anchored stop for adds)
+    entries: int = 0
+    last_entry_price: float | None = None
+    minutes_since_last_entry: float | None = None
+    buys_today_student: int = 0
+    sell_pending: bool = False
 
 
 def allocation_for(category: str, cfg: StrategyConfig) -> float:
@@ -97,8 +107,28 @@ def check_buy(c: BuyContext) -> RiskResult:
         f"price {c.latest_price} age {age_min:.1f} min" if age_min is not None else "no latest price")
     open_same = [o for o in c.open_orders if o.get("symbol") == c.symbol]
     add("no open order for symbol", not open_same, f"{len(open_same)} open order(s)")
-    add("not already bought today", not c.already_bought_today,
-        "already submitted a BUY today" if c.already_bought_today else "first BUY today")
+    if c.intraday:
+        ic = c.cfg.intraday
+        add("entries per position", c.entries < ic.max_entries_per_position,
+            f"{c.entries} of {ic.max_entries_per_position} entries used")
+        gap = c.minutes_since_last_entry
+        add("time since last entry", gap is None or gap >= ic.min_minutes_between_entries,
+            "first entry" if gap is None else f"{gap:.0f} min (minimum {ic.min_minutes_between_entries})")
+        if c.entry_kind == "add":
+            need = (c.last_entry_price or 0) - ic.min_add_drop_atr * (c.atr or 0)
+            ok = bool(c.latest_price and c.last_entry_price and c.atr and c.latest_price <= need)
+            add("add only below the last entry", ok,
+                f"price {c.latest_price} vs last entry {c.last_entry_price} - {ic.min_add_drop_atr:g} x ATR = "
+                f"{need:.2f}" if c.last_entry_price and c.atr else "no last entry / ATR")
+        add("stop below price", bool(c.stop and c.latest_price and c.stop < c.latest_price),
+            f"stop {c.stop}, price {c.latest_price}")
+        add("student BUYs today", c.buys_today_student < ic.max_buys_per_student_per_day,
+            f"{c.buys_today_student} of {ic.max_buys_per_student_per_day}")
+        add("no SELL waiting for this stock", not c.sell_pending,
+            "a SELL approval is open" if c.sell_pending else "none")
+    else:
+        add("not already bought today", not c.already_bought_today,
+            "already submitted a BUY today" if c.already_bought_today else "first BUY today")
     add("new-buy limit per run", c.buys_this_run < r.max_new_buys_per_run,
         f"{c.buys_this_run} of {r.max_new_buys_per_run} used")
 
@@ -115,6 +145,9 @@ def check_buy(c: BuyContext) -> RiskResult:
     allocation = allocation_for(c.category, c.cfg)
     cap = c.student.starting_capital * r.max_position_pct / 100
     room_alloc = allocation - cur_value
+    if c.intraday and c.entry_kind == "initial":
+        # leave room to add on later, evidence-based dips (scaling in)
+        room_alloc = allocation * c.cfg.intraday.initial_entry_fraction - cur_value
     room_cap = cap - cur_value
     cost_basis = sum(float(p.get("qty", 0)) * float(p.get("avg_entry") or 0) for p in c.positions.values())
     open_buy_value = sum(float(o.get("notional") or 0) or float(o.get("qty") or 0) * (price or 0)
@@ -123,9 +156,15 @@ def check_buy(c: BuyContext) -> RiskResult:
     cash = float(acct.get("non_marginable_buying_power") or acct.get("cash") or 0)
     dollars = min(room_alloc, room_cap, room_budget, cash)
     qty = 0
+    cost = c.cfg.intraday.cost_bps / 10_000 if c.intraday else 0.0
     if price and dollars > 0:
-        qty_room = math.floor(dollars / price)
-        if c.atr and c.atr > 0:
+        qty_room = math.floor(dollars / (price * (1 + cost)))
+        if c.intraday and c.stop:
+            from .intraday import risk_qty
+            pos = c.positions.get(c.symbol, {})
+            qty_risk = risk_qty(c.cfg, c.student.starting_capital, price, c.stop, float(pos.get("qty") or 0),
+                                float(pos.get("avg_entry") or 0) or None, c.entry_kind)
+        elif c.atr and c.atr > 0:
             risk_dollars = c.student.starting_capital * r.risk_per_trade_pct / 100
             qty_risk = math.floor(risk_dollars / (r.stop_atr_mult * c.atr))
         else:
@@ -135,7 +174,7 @@ def check_buy(c: BuyContext) -> RiskResult:
                   f"${room_budget:,.0f}, cash ${cash:,.0f}) -> {qty_room} sh; ATR risk -> {qty_risk} sh")
     else:
         sizing = f"no room or no price (room ${dollars:,.0f})"
-    notional = round(qty * (price or 0), 2)
+    notional = round(qty * (price or 0) * (1 + cost), 2)
     add("position within allocation and 15% cap", room_alloc > 0 and room_cap > 0,
         f"current ${cur_value:,.0f}, allocation ${allocation:,.0f}, cap ${cap:,.0f}")
     add("within student capital budget", room_budget > 0, f"used ${cost_basis + open_buy_value:,.0f} of "

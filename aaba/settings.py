@@ -152,6 +152,37 @@ class AgentCfg(BaseModel):
     crew_time_budget_seconds: int = Field(900, ge=30, le=7200)  # whole agent phase; then the safety net takes over
 
 
+class IntradayCfg(BaseModel):
+    """Intraday decisions (aaba/intraday.py). Off by default: the daily strategy is unchanged."""
+    enabled: bool = False
+    cycle_minutes: int = Field(10, ge=5, le=60)          # re-evaluate every N minutes in the session
+    bar_minutes: int = Field(5, ge=1, le=30)             # completed intraday candles of this length
+    first_cycle: str = "09:50"                           # New York time
+    last_cycle: str = "15:40"                            # no new decisions in the last 20 minutes
+    feed: Literal["iex", "sip"] = "iex"                  # free plans: IEX is real-time, SIP is 15 min late
+    lookback_days: int = Field(5, ge=2, le=20)           # sessions of intraday history for indicators
+    max_bar_age_minutes: float = Field(20, gt=0, le=120) # newest completed candle must be this fresh
+    llm_only_when_actionable: bool = True                # call the LLM agent only when a cycle has BUY/SELL
+    max_entries_per_position: int = Field(3, ge=1, le=6)
+    initial_entry_fraction: float = Field(0.5, gt=0, le=1)  # first entry uses at most this share of the allocation
+    min_minutes_between_entries: int = Field(30, ge=5, le=390)
+    min_add_drop_atr: float = Field(0.25, gt=0, le=3)    # each add at least this x daily ATR below the last entry
+    max_position_risk_pct: float = Field(1.5, gt=0, le=3)  # risk to the anchored stop, % of starting capital
+    max_buys_per_student_per_day: int = Field(10, ge=0, le=60)
+    min_reward_risk: float = Field(1.5, gt=0, le=10)
+    min_relative_volume: float = Field(0.8, ge=0, le=5)  # volume of the confirming candle vs its 20-candle average
+    market_weak_drop_pct: float = Field(1.0, gt=0, le=10)  # SPY down this much and below VWAP: no new entries
+    profit_take_rsi: float = Field(80, ge=50, le=100)
+    cost_bps: float = Field(5, ge=0, le=100)             # slippage + spread estimate per side, in basis points
+
+    @field_validator("first_cycle", "last_cycle")
+    @classmethod
+    def _hhmm(cls, v):
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", v):
+            raise ValueError(f"'{v}' must look like HH:MM")
+        return v
+
+
 class ReportCfg(BaseModel):
     timezone: str = "Asia/Kolkata"
 
@@ -169,6 +200,7 @@ class StrategyConfig(BaseModel):
     approvals: ApprovalCfg = ApprovalCfg()
     schedule: ScheduleCfg = ScheduleCfg()
     agent: AgentCfg = AgentCfg()
+    intraday: IntradayCfg = IntradayCfg()
     reports: ReportCfg = ReportCfg()
 
 

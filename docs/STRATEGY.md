@@ -93,3 +93,45 @@ NVDA closed at $229.28 on 9 Oct. If its ATR14 were $8 (illustration only), 1% ri
 shares and the $10,000 allocation 43, so the allocation would set the size. For a very volatile name
 the ATR rule sets it instead.
 The run limit of 6 BUYs and the 5% daily halt are our own guard rails for an unattended system.
+
+## Intraday decisions (optional, `intraday.enabled`)
+
+When `intraday.enabled` is true in `configs/strategy.json`, every stock is re-decided every
+`cycle_minutes` (default 10) from `first_cycle` 09:50 to `last_cycle` 15:40 New York time, using
+**completed** 5-minute candles (Alpaca IEX feed, real time) plus the completed daily bars. The code
+is `aaba/intraday.py`; the live cycle and the intraday backtest call the same `decide()`.
+
+| Evidence | How it is used |
+|---|---|
+| Daily trend: close vs EMA200, EMA50 rising over 5 sessions, EMA20 vs EMA50 | "healthy trend" is required for dip entries and adds |
+| Daily rules engine (the sections above) | a daily BUY can be entered when the intraday trend confirms it; a daily SELL raises a SELL request |
+| VWAP, intraday EMA9/EMA21 and slope, intraday RSI14 | momentum confirmation; intraday downtrend detection |
+| Relative volume, bullish candle, RSI recovering from <= 45 | a "bounce" that confirms a dip is being bought |
+| Support (prior-day low, 30-min opening range low, daily EMA20/EMA50, lower band) | stop placement for dip entries |
+| Resistance (prior-day high, session high, upper band) | target for reward-to-risk |
+| SPY change vs its prior close and VWAP | weak market blocks new entries |
+
+**No buying into sustained weakness.** A BUY is refused when price is below VWAP with EMA9 < EMA21
+and EMA21 falling, when 4+ of the last 6 candles made lower lows, when price is 0.25 x ATR below the
+prior day's low or 0.5 x ATR below the daily EMA50, when SPY is down `market_weak_drop_pct` and
+below its VWAP, or when news/earnings veto it.
+
+**Scaling in.** The one-BUY-per-day rule is replaced by: the first entry uses at most
+`initial_entry_fraction` (50%) of the stock's allocation; an add needs a confirmed bounce at least
+`min_add_drop_atr` (0.25) x ATR below the last entry, at least `min_minutes_between_entries` (30)
+after it, at most `max_entries_per_position` (3) entries, and the whole position's risk to the
+**anchored stop of the first entry (never lowered)** within `max_position_risk_pct` (1.5%) of
+capital. Allocation, 15% cap, cash, minimum order, daily loss halt and the per-run and per-day BUY
+limits still apply. Every order has its own client order ID (`aaba-<signal id>-buy`).
+
+**Reward-to-risk.** Every BUY needs (target - entry) / (entry - stop) >= `min_reward_risk` (1.5)
+after `cost_bps` (5 bps) each way. Momentum entries stop just below VWAP / EMA21; dip entries just
+below support; never closer than 0.5 x ATR or wider than 2 x ATR.
+
+**Exits** are SELL approval requests (the student's PIN is still required): price below the anchored
+stop, a daily SELL rule, an intraday trend break for satellites, or price above the upper band with
+intraday RSI >= `profit_take_rsi`. While a request is waiting, no new request and no new BUY are
+made for that stock.
+
+**LLM use.** In intraday cycles the agent is called only when a cycle has a BUY or SELL; quiet
+cycles cost no LLM calls and write no report files.

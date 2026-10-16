@@ -283,7 +283,10 @@ def safety_net(run_id: str, tools: dict, students, exec_buys: bool) -> list[dict
     _call(tools["prepare_market_data"], run_id=run_id)
     for st in students:
         _call(tools["process_approved_sells"], student_id=st.student_id, run_id=run_id)
-        _call(tools["evaluate_student"], run_id=run_id, student_id=st.student_id)
+        ev = _call(tools["evaluate_student"], run_id=run_id, student_id=st.student_id)
+        if isinstance(ev, dict) and ev.get("error") and not db.student_signals(st.student_id, run_id=run_id):
+            # the tool reports errors as data; a student with no decisions must not look like a quiet day
+            raise RuntimeError(f"evaluate_student failed for {st.student_id}: {str(ev['error'])[:300]}")
         for sig in db.q("SELECT * FROM signals WHERE run_id=? AND student_id=? AND outcome IS NULL",
                         (run_id, st.student_id)):
             why = "agent did not act on this signal"
@@ -340,6 +343,7 @@ def run_workflow(mode: str = "analysis", trigger: str = "manual", use_llm: bool 
         texts: dict[str, str] = {}
         group_text, agent_error, actions, status, err = None, None, [], "DONE", None
         crew_thread = None
+        skip_crew = False
         try:
             from crewai_tools import MCPServerAdapter
             with MCPServerAdapter(_server_params(), connect_timeout=60) as mcp_tools:
@@ -348,7 +352,18 @@ def run_workflow(mode: str = "analysis", trigger: str = "manual", use_llm: bool 
                 if missing:
                     raise RuntimeError(f"MCP server is missing tools: {missing}")
                 safe = True
-                if llm is not None:
+                if llm is not None and trigger == "intraday" and cfg.intraday.llm_only_when_actionable:
+                    # decide first (deterministic, through the same MCP tools); the agent is only
+                    # needed when there is something to act on
+                    _call(tools["prepare_market_data"], run_id=run_id)
+                    for st in students:
+                        _call(tools["evaluate_student"], run_id=run_id, student_id=st.student_id)
+                    if not db.q("SELECT 1 FROM signals WHERE run_id=? AND outcome IS NULL AND action IN "
+                                "('BUY','SELL') LIMIT 1", (run_id,)):
+                        skip_crew = True
+                        db.log_event("INFO", "crew", "intraday cycle: no BUY or SELL decision, the LLM agent "
+                                                     "was not called", run_id)
+                if llm is not None and not skip_crew:
                     texts, group_text, agent_error, safe, crew_thread = _run_crew_with_budget(
                         run_id, tools, llm, students, cfg.agent.crew_time_budget_seconds)
                     if agent_error:
@@ -361,15 +376,18 @@ def run_workflow(mode: str = "analysis", trigger: str = "manual", use_llm: bool 
             db.log_event("ERROR", "workflow", err, run_id, data={"trace": traceback.format_exc()[-2000:]})
         finally:
             files = []
-            for st in students:
+            acted = db.q("SELECT 1 FROM signals WHERE run_id=? AND action IN ('BUY','SELL') LIMIT 1", (run_id,))
+            quiet_cycle = trigger == "intraday" and status == "DONE" and not agent_error and not acted
+            for st in ([] if quiet_cycle else students):      # a quiet intraday cycle writes no report files
                 try:
                     files.append(str(reports.student_report(run_id, st.student_id, texts.get(st.student_id),
                                                             agent_error or (llm_note if llm is None else None))))
                 except Exception as e:  # noqa: BLE001
                     db.log_event("ERROR", "report", f"report failed: {type(e).__name__}: {e}", run_id, st.student_id)
             try:
-                files.append(str(reports.group_report(run_id, group_text, actions,
-                                                      agent_error or (llm_note if llm is None else None))))
+                if not quiet_cycle:
+                    files.append(str(reports.group_report(run_id, group_text, actions,
+                                                          agent_error or (llm_note if llm is None else None))))
             except Exception as e:  # noqa: BLE001
                 db.log_event("ERROR", "report", f"group report failed: {type(e).__name__}: {e}", run_id)
             if status == "DONE" and agent_error:

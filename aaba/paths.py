@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "configs"
 STUDENTS_FILE = CONFIG_DIR / "students.json"
-STRATEGY_FILE = CONFIG_DIR / "strategy.json"
+STRATEGY_FILE = Path(os.getenv("AABA_STRATEGY_FILE", CONFIG_DIR / "strategy.json"))   # env: also seen by the MCP child
 CONFIG_HISTORY_DIR = CONFIG_DIR / "history"
 
 DATA_DIR = Path(os.getenv("AABA_DATA_DIR", ROOT / "data"))

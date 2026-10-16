@@ -328,6 +328,18 @@ are excluded because they contain account numbers. If you want to submit them, r
 
 To set up another laptop: `git clone <url>`, then steps 2 to 5.
 
+## Intraday decisions (off by default)
+
+`intraday.enabled: true` in `configs/strategy.json` makes the scheduler re-decide every stock every
+10 minutes during the session (09:50-15:40 New York) from completed 5-minute candles, with
+evidence-based dip buying, disciplined scaling in and an anchored stop. All rules are in
+[docs/STRATEGY.md](docs/STRATEGY.md#intraday-decisions-optional-intradayenabled). Compare it with
+the daily strategy first:
+
+```powershell
+python main.py backtest-intraday
+```
+
 ## Modes at a glance
 
 | Mode | Signals and checks | SELL approvals | Orders sent |
