@@ -65,16 +65,23 @@ def create_request(run_id: str, signal: dict, student_id: str, account_number: s
     db.log_event("INFO", "sell_approval_requested",
                  f"SELL {qty:g} {signal['symbol']} waiting for {student_id} approval", run_id, student_id,
                  {"approval_id": aid})
+    from . import notify
+    notify.queue("created", dict(row))
     return dict(row)
 
 
 def expire_stale() -> int:
     if demo.is_read_only():
         return 0            # read-only processes never change the database
-    n = db.ex("UPDATE approvals SET status='EXPIRED', decision_note='not decided before expiry' "
-              "WHERE status='PENDING' AND expires_at < ?", (clock.iso(),))
-    n += db.ex("UPDATE approvals SET status='EXPIRED', decision_note='approved but not executed before expiry' "
-               "WHERE status='APPROVED' AND expires_at < ?", (clock.iso(),))
+    from . import notify
+    now, n = clock.iso(), 0
+    for status, note in (("PENDING", "not decided before expiry"),
+                         ("APPROVED", "approved but not executed before expiry")):
+        for ap in db.q("SELECT * FROM approvals WHERE status=? AND expires_at < ?", (status, now)):
+            if db.ex("UPDATE approvals SET status='EXPIRED', decision_note=? WHERE approval_id=? AND status=?",
+                     (note, ap["approval_id"], status)) == 1:
+                n += 1
+                notify.queue("expired", {**ap, "status": "EXPIRED"}, note)
     return n
 
 
@@ -126,6 +133,43 @@ def verify_admin_pin(pin: str) -> bool:
     return hmac.compare_digest(str(pin).strip().encode(), expected.encode())
 
 
+PIN_HASH_ITERATIONS = 600_000
+
+
+def hash_pin(pin: str, iterations: int = PIN_HASH_ITERATIONS, salt: bytes | None = None) -> str:
+    """Salted, slow hash of a PIN for the dashboard (which never sees the PIN itself)."""
+    import hashlib
+    import os
+    salt = salt or os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", str(pin).strip().encode(), salt, iterations)
+    return f"pbkdf2_sha256:{iterations}:{salt.hex()}:{dk.hex()}"      # ":" (no "$": safe in env files)
+
+
+def check_pin_hash(pin: str, stored: str) -> bool:
+    import hashlib
+    try:
+        algo, iters, salt, digest = stored.split(":")
+        if algo != "pbkdf2_sha256" or not pin:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", str(pin).strip().encode(), bytes.fromhex(salt), int(iters))
+        return hmac.compare_digest(dk.hex(), digest)
+    except (ValueError, AttributeError):
+        return False
+
+
+def dashboard_approvals_enabled() -> bool:
+    """The private dashboard may record SELL decisions (AABA_APPROVALS_ON_DASHBOARD=1). Never the demo."""
+    import os
+    return (not demo.is_demo()
+            and os.getenv("AABA_APPROVALS_ON_DASHBOARD", "").strip().lower() in ("1", "true", "yes", "on"))
+
+
+def _pin_hash(student_id: str) -> str:
+    import os
+    st = load_students().get(student_id)
+    return os.getenv(f"{st.env_prefix}_APPROVAL_PIN_HASH", "").strip()
+
+
 def verify_pin(student_id: str, pin: str) -> bool:
     st = load_students().get(student_id)
     expected = st.approval_pin()
@@ -136,9 +180,11 @@ def verify_pin(student_id: str, pin: str) -> bool:
 
 def decide(approval_id: str, claimed_student_id: str, pin: str, decision: str, note: str = "") -> dict:
     """decision: 'approve' or 'reject'. Raises ApprovalError with a plain reason on refusal."""
-    if demo.is_read_only():
-        raise ApprovalError("read-only demo: SELL approvals are disabled" if demo.is_demo()
-                            else "read-only dashboard: SELL approvals are disabled here")
+    if demo.is_demo():
+        raise ApprovalError("read-only demo: SELL approvals are disabled")
+    on_dashboard = demo.is_read_only()            # the private dashboard: PIN hashes only, no broker access
+    if on_dashboard and not dashboard_approvals_enabled():
+        raise ApprovalError("read-only dashboard: SELL approvals are disabled here")
     decision = decision.lower().strip()
     if decision not in ("approve", "reject"):
         raise ApprovalError("decision must be approve or reject")
@@ -159,18 +205,27 @@ def decide(approval_id: str, claimed_student_id: str, pin: str, decision: str, n
                      f"{claimed_student_id} tried to decide {ap['student_id']}'s request {approval_id}",
                      ap["run_id"], ap["student_id"])
         raise ApprovalError("only the student who owns this portfolio can decide this request")
-    problem = pin_problem(load_students().get(claimed_student_id).approval_pin())
-    if problem:
-        raise ApprovalError(f"the approval PIN for {claimed_student_id} in .env cannot be used: {problem}; "
-                            f"set a new one")
-    if not verify_pin(claimed_student_id, pin):
+    if on_dashboard:
+        stored = _pin_hash(claimed_student_id)
+        if not stored:
+            raise ApprovalError(f"dashboard approvals are not set up for {claimed_student_id} (no PIN hash)")
+        pin_ok = check_pin_hash(pin, stored)
+    else:
+        problem = pin_problem(load_students().get(claimed_student_id).approval_pin())
+        if problem:
+            raise ApprovalError(f"the approval PIN for {claimed_student_id} in .env cannot be used: {problem}; "
+                                f"set a new one")
+        pin_ok = verify_pin(claimed_student_id, pin)
+    if not pin_ok:
         _attempt(approval_id, claimed_student_id, ap["student_id"], False, "wrong PIN")
         raise ApprovalError("wrong PIN")
     if ap["status"] != "PENDING":
         _attempt(approval_id, claimed_student_id, ap["student_id"], False, f"status {ap['status']}")
         raise ApprovalError(f"request is {ap['status']}, not PENDING")
     if is_expired(ap):
-        db.ex("UPDATE approvals SET status='EXPIRED' WHERE approval_id=? AND status='PENDING'", (approval_id,))
+        if db.ex("UPDATE approvals SET status='EXPIRED' WHERE approval_id=? AND status='PENDING'", (approval_id,)) == 1:
+            from . import notify
+            notify.queue("expired", {**ap, "status": "EXPIRED"}, "not decided before expiry")
         _attempt(approval_id, claimed_student_id, ap["student_id"], False, "expired")
         raise ApprovalError("request has expired")
     fp = fingerprint(ap["student_id"], ap["account_number"], ap["symbol"], float(ap["qty"]), ap["signal_id"],
@@ -188,5 +243,9 @@ def decide(approval_id: str, claimed_student_id: str, pin: str, decision: str, n
         raise ApprovalError("request was changed by someone else; reload and try again")
     _attempt(approval_id, claimed_student_id, ap["student_id"], True, new_status)
     db.log_event("INFO", "approval_decided", f"{new_status} SELL {ap['qty']:g} {ap['symbol']} by {st.name}",
-                 ap["run_id"], ap["student_id"], {"approval_id": approval_id})
-    return db.q1("SELECT * FROM approvals WHERE approval_id=?", (approval_id,))
+                 ap["run_id"], ap["student_id"], {"approval_id": approval_id, "via": "dashboard" if on_dashboard
+                                                  else "server"})
+    row = db.q1("SELECT * FROM approvals WHERE approval_id=?", (approval_id,))
+    from . import notify
+    notify.queue("approved" if new_status == "APPROVED" else "rejected", row, note)
+    return row

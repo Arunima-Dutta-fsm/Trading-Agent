@@ -9,6 +9,8 @@ Group=aabadata
 UMask=0002
 WorkingDirectory=/opt/aaba
 EnvironmentFile=/etc/aaba/dashboard.env
+# optional: PIN hashes + AABA_APPROVALS_ON_DASHBOARD=1 (deploy/make_pin_hashes.py); no file = read-only
+EnvironmentFile=-/etc/aaba/dashboard-approvals.env
 Environment=HOME=/var/lib/aaba/web
 Environment=STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ExecStart=/opt/aaba/.venv/bin/python -m streamlit run app/streamlit_app.py \

@@ -108,6 +108,18 @@ def intraday_job():
         return "failed"
 
 
+def notify_job() -> dict:
+    """Every minute, day and night: expire overdue SELL requests, then send queued emails."""
+    demo.guard("sending notifications")
+    from . import approvals, notify
+    try:
+        approvals.expire_stale()
+        return notify.flush()
+    except Exception as e:  # noqa: BLE001
+        db.log_event("ERROR", "notify", f"notification job failed: {type(e).__name__}: {e}")
+        return {"error": type(e).__name__}
+
+
 def catch_up_if_missed() -> str:
     """After a restart: if today's scheduled run was missed (server down, crash), run it now,
     but only on a trading day, after the scheduled time and well before today's close.
@@ -195,6 +207,7 @@ def start():
                       id=f"daily-{t}", max_instances=1, coalesce=True, misfire_grace_time=900)
     sched.add_job(approved_sell_job, IntervalTrigger(minutes=cfg.schedule.approved_sell_check_minutes, timezone=tz),
                   id="approved-sells", max_instances=1, coalesce=True)
+    sched.add_job(notify_job, IntervalTrigger(minutes=1, timezone=tz), id="notify", max_instances=1, coalesce=True)
     if cfg.intraday.enabled:
         sched.add_job(intraday_job, CronTrigger(day_of_week="mon-fri", hour="9-15",
                                                 minute=f"*/{cfg.intraday.cycle_minutes}", timezone=tz),

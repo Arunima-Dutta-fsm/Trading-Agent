@@ -125,6 +125,18 @@ CREATE TABLE IF NOT EXISTS approval_attempts (
     success INTEGER NOT NULL,
     detail TEXT
 );
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    student_id TEXT NOT NULL,
+    approval_id TEXT,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    sent_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,

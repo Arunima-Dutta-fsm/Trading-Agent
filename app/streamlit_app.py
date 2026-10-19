@@ -283,6 +283,33 @@ def make_student_page(student_id: str):
     return page
 
 
+def approval_form(ap: dict, group, execute: bool) -> None:
+    """Student ID + PIN + Approve/Reject. The server checks that the student owns the request and the PIN
+    is theirs (lockout after repeated wrong PINs). `execute`: send the order straight away (local
+    dashboard with broker access); the private server dashboard only records the decision."""
+    with st.form(f"f_{ap['approval_id']}"):
+        ids = [s.student_id for s in group.students]
+        sid = st.selectbox("Your student ID", ids, index=ids.index(ap["student_id"]),
+                           format_func=lambda x: f"{x} - {group.get(x).name}")
+        pin = st.text_input("Your approval PIN", type="password")
+        note = st.text_input("Note (optional)")
+        c1, c2 = st.columns(2)
+        yes = c1.form_submit_button("Approve SELL", type="primary")
+        no = c2.form_submit_button("Reject")
+    if yes or no:
+        try:
+            res = approvals.decide(ap["approval_id"], sid, pin, "approve" if yes else "reject", note)
+            st.success(f"{res['status']} by {res['decided_by']}")
+            if res["status"] == "APPROVED":
+                if execute:
+                    st.write(controller.execute_approved_sell(ap["approval_id"], actor="dashboard"))
+                else:
+                    st.info("The trading engine will re-check and send this SELL during market hours, usually "
+                            "within 10 minutes. An email confirms the result.")
+        except approvals.ApprovalError as e:
+            st.error(f"Refused: {e}")
+
+
 def page_approvals():
     st.title("Approval Centre")
     sim_banner()
@@ -307,31 +334,23 @@ def page_approvals():
             with st.expander("Indicator evidence"):
                 st.json({k: v for k, v in ev.items() if k not in ("news",)})
             if READ_ONLY:
-                st.caption(f"Approve / reject: {DEMO_NOTE}" + ("" if DEMO else
-                           " Approve with: sudo aaba approve <approval id> --student <S1/S2/S3> on the server."))
+                if DEMO or not approvals.dashboard_approvals_enabled():
+                    st.caption(f"Approve / reject: {DEMO_NOTE}" + ("" if DEMO else
+                               " Approve with: sudo aaba approve <approval id> --student <S1/S2/S3> on the server."))
+                    continue
+                if ap["status"] == "APPROVED":
+                    st.info(f"Approved by {ap['decided_by']}. The trading engine re-checks it and sends the SELL "
+                            f"during market hours, usually within 10 minutes. "
+                            + (f"Last check: {ap['execution_detail']}" if ap.get("execution_detail") else ""))
+                    continue
+                approval_form(ap, group, execute=False)
                 continue
             if ap["status"] == "APPROVED":
                 st.info(ap.get("execution_detail") or "Approved; will be sent after the re-check.")
                 if st.button("Try to execute now", key=f"x_{ap['approval_id']}"):
                     st.write(controller.execute_approved_sell(ap["approval_id"], actor="dashboard"))
                 continue
-            with st.form(f"f_{ap['approval_id']}"):
-                ids = [s.student_id for s in group.students]
-                sid = st.selectbox("Your student ID", ids, index=ids.index(ap["student_id"]),
-                                   format_func=lambda x: f"{x} - {group.get(x).name}")
-                pin = st.text_input("Your approval PIN", type="password")
-                note = st.text_input("Note (optional)")
-                c1, c2 = st.columns(2)
-                yes = c1.form_submit_button("Approve SELL", type="primary")
-                no = c2.form_submit_button("Reject")
-            if yes or no:
-                try:
-                    res = approvals.decide(ap["approval_id"], sid, pin, "approve" if yes else "reject", note)
-                    st.success(f"{res['status']} by {res['decided_by']}")
-                    if res["status"] == "APPROVED":
-                        st.write(controller.execute_approved_sell(ap["approval_id"], actor="dashboard"))
-                except approvals.ApprovalError as e:
-                    st.error(f"Refused: {e}")
+            approval_form(ap, group, execute=True)
     st.subheader("Decided requests")
     done = pd.DataFrame(db.q("SELECT approval_id, student_id, symbol, qty, status, decided_by, decided_at, "
                              "execution_detail FROM approvals WHERE status NOT IN ('PENDING','APPROVED') "
@@ -487,13 +506,17 @@ pages = {
                 st.Page(page_system, title="System", icon="🛠️", url_path="system", default=start == "system")],
 }
 if REFRESH_SECONDS:
+    import time as _time
+
     @st.fragment(run_every=REFRESH_SECONDS)
     def _auto_refresh():
-        # first call (inside a full page run) arms the timer; the timed call reruns the whole page
-        if st.session_state.get("_refresh_armed"):
-            st.session_state["_refresh_armed"] = False
+        # reload the whole page only when REFRESH_SECONDS have passed since the last full run; a click
+        # (which is itself a full run) resets the clock, so user actions are never swallowed
+        if _time.time() - st.session_state.get("_page_loaded_at", 0) >= REFRESH_SECONDS - 1:
             st.rerun()
-        st.session_state["_refresh_armed"] = True
 
+nav = st.navigation(pages)
+st.session_state["_page_loaded_at"] = __import__("time").time()
+if REFRESH_SECONDS and nav.title != "Approval Centre":     # never reload while someone types a PIN
     _auto_refresh()
-st.navigation(pages).run()
+nav.run()

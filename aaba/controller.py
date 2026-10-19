@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from . import approvals, broker as brokers, clock, db, demo, paths
+from . import approvals, broker as brokers, clock, db, demo, notify, paths
 from .indicators import add_indicators, clean_bars, colnames
 from .market_data import (MarketClock, Session, bar_session_date, drop_incomplete_bars, get_provider,
                           last_completed_session)
@@ -739,6 +739,7 @@ def execute_approved_sell(approval_id: str, actor: str = "system") -> dict:
                   (rr.summary()[:1500], approval_id))
             db.log_event("WARNING", "sell_invalidated", f"approved SELL {sym} failed re-check: {rr.summary()}",
                          ap["run_id"], sid)
+            notify.queue("invalidated", {**ap, "status": "INVALIDATED"}, rr.summary())
             return {"approval_id": approval_id, "symbol": sym, "result": "INVALIDATED", "detail": rr.summary()}
         if run["mode"] == "dry_run":
             db.ex("UPDATE approvals SET status='EXECUTED_DRY_RUN', execution_detail=? WHERE approval_id=?",
@@ -754,6 +755,13 @@ def execute_approved_sell(approval_id: str, actor: str = "system") -> dict:
         status = "EXECUTED" if res["ok"] else "FAILED"
         db.ex("UPDATE approvals SET status=?, client_order_id=?, execution_detail=? WHERE approval_id=?",
               (status, cid, res["detail"][:1500], approval_id))
+        fill = f"broker status {res.get('status')}"
+        if res.get("filled_qty"):
+            o = db.q1("SELECT filled_qty, filled_avg_price FROM orders WHERE client_order_id=?", (cid,)) or {}
+            if o.get("filled_avg_price"):
+                fill = f"filled {o['filled_qty']:g} shares at ${o['filled_avg_price']:,.2f}"
+        notify.queue("executed" if res["ok"] else "failed", {**ap, "status": status},
+                     f"{fill}; {res['detail'][:300]}")
         return {"approval_id": approval_id, "symbol": sym, "result": status, "detail": res["detail"]}
     except Exception as e:
         return back_to_approved(f"error during re-check ({type(e).__name__}); will retry later")
